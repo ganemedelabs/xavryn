@@ -1,0 +1,102 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+    --ground: oklch(0.975 0.003 280);
+    --panel: oklch(1 0 0);
+    --panel-subtle: oklch(0.985 0.002 280);
+    --ink: oklch(0.205 0.015 285);
+    --soft: oklch(0.54 0.016 282);
+    --line: oklch(0.925 0.006 280);
+    --line-subtle: oklch(0.965 0.004 280);
+    --accent: oklch(0.5 0.35 270);
+    --accent-soft: oklch(0.52 0.22 292 / 0.1);
+    --warn: oklch(0.637 0.237 25.3);
+
+    --scrollbar-size: 10px;
+    --scrollbar-thumb: color-mix(in oklch, var(--soft) 38%, transparent);
+    --scrollbar-thumb-hover: color-mix(in oklch, var(--soft) 60%, transparent);
+    --scrollbar-thumb-active: color-mix(in oklch, var(--ink) 55%, transparent);
+    --scrollbar-track: transparent;
+}
+
+:root.dark {
+    --ground: oklch(0.155 0.008 285);
+    --panel: oklch(0.205 0.01 285);
+    --panel-subtle: oklch(0.265 0.012 285);
+    --ink: oklch(0.975 0.003 280);
+    --soft: oklch(0.69 0.014 282);
+    --line: oklch(0.28 0.012 285);
+    --line-subtle: oklch(0.235 0.01 285);
+    --accent: oklch(0.65 0.35 270);
+    --accent-soft: oklch(0.6 0.22 292 / 0.15);
+    --warn: oklch(0.704 0.191 22.2);
+
+    --scrollbar-thumb: color-mix(in oklch, var(--soft) 34%, transparent);
+    --scrollbar-thumb-hover: color-mix(in oklch, var(--soft) 55%, transparent);
+    --scrollbar-thumb-active: color-mix(in oklch, var(--ink) 50%, transparent);
+}
+
+@theme inline {
+    --color-ground: var(--ground);
+    --color-panel: var(--panel);
+    --color-panel-subtle: var(--panel-subtle);
+    --color-ink: var(--ink);
+    --color-soft: var(--soft);
+    --color-line: var(--line);
+    --color-line-subtle: var(--line-subtle);
+    --color-accent: var(--accent);
+    --color-accent-soft: var(--accent-soft);
+    --color-warn: var(--warn);
+    --font-mono: var(--mono);
+    --font-sans:
+        system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, "Open Sans",
+        "Helvetica Neue", sans-serif;
+}
+
+@layer base {
+    * {
+        scrollbar-width: thin;
+        scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+    }
+
+    *::-webkit-scrollbar {
+        width: var(--scrollbar-size);
+        height: var(--scrollbar-size);
+    }
+
+    *::-webkit-scrollbar-track {
+        background: var(--scrollbar-track);
+    }
+
+    *::-webkit-scrollbar-thumb {
+        background-color: var(--scrollbar-thumb);
+        background-clip: content-box;
+        border: 2px solid transparent;
+        border-radius: 9999px;
+    }
+
+    *::-webkit-scrollbar-thumb:hover {
+        background-color: var(--scrollbar-thumb-hover);
+    }
+
+    *::-webkit-scrollbar-thumb:active {
+        background-color: var(--scrollbar-thumb-active);
+    }
+
+    *::-webkit-scrollbar-corner {
+        background: transparent;
+    }
+
+    body {
+        @apply bg-ground text-ink text-[15px] leading-relaxed antialiased;
+        background-image: radial-gradient(circle at 50% 0%, var(--accent-soft), transparent 50%);
+        background-attachment: fixed;
+    }
+
+    :focus-visible {
+        outline: 2px solid var(--accent);
+        outline-offset: 2px;
+    }
+}

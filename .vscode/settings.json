@@ -1,0 +1,12 @@
+{
+    "editor.formatOnSave": true,
+    "editor.codeActionsOnSave": {
+        "source.fixAll.eslint": "always",
+        "source.sortImports": "always",
+        "source.fixAll.ts": "always"
+    },
+    "js/ts.preferences.importModuleSpecifierEnding": "minimal",
+    "files.associations": {
+        "*.css": "tailwindcss"
+    }
+}
