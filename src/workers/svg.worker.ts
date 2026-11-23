@@ -8,10 +8,11 @@ self.onmessage = (e: MessageEvent) => {
         const svg = imageDataToSVG(imageData, options);
         const durationMs = Math.round(performance.now() - start);
         self.postMessage({ id, svg, durationMs });
-    } catch (err: unknown) {
+    } catch (error: unknown) {
         self.postMessage({
             id,
-            error: (err as Error).message || "Conversion failed",
+            error: (error as Error).message || "Conversion failed",
+            cause: error,
         });
     }
 };

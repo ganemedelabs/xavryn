@@ -1,54 +1,9 @@
-/**
- * img-to-svg.ts
- *
- * Converts an ImageData (RGBA) into an SVG string with smooth Bézier paths and
- * fitted linear / radial gradients, instead of posterized color bands.
- *
- * Pipeline:
- *   1. Convert to OKLab. "Ink" = solid dark pixels (outlines, black spots).
- *      Dark-but-not-black areas (e.g. dark hair) are NOT ink; they are regions.
- *   2. Find hard edges (abrupt colour change). Flat areas between edges and ink
- *      become regions. Edge pixels join the neighbouring region whose colour they
- *      match best, so boundaries sit where the colour really flips.
- *   3. Per region: fit flat / linear gradient / radial gradient (OKLab residual),
- *      reduce the colour profile to a few stops.
- *   4. If a region still has clearly mis-fitted areas (strong residual), those
- *      are refit as their own patches painted on top (recursive).
- *   5. Trace each region at subpixel precision (marching squares), detect
- *      corners, fit cubic Béziers (Schneider). Ink outlines are traced from a soft
- *      coverage field, so line thickness is right even for thin strokes.
- *   6. Paint largest region first. Each region is grown underneath whatever is
- *      painted after it (and under the ink), so no seams show.
- */
-
 export interface SVGOptions {
     maxSize?: number;
     alphaCutoff?: number;
     inkL?: number;
-    minRegionArea?: number;
-    expand?: number;
-    flatTol?: number;
-    splitTol?: number;
-    maxDepth?: number;
-    minSplitArea?: number;
-    bins?: number;
-    stopTol?: number;
-    maxStops?: number;
-    curveTol?: number;
-    cornerAngle?: number;
-    cornerWindow?: number;
-    minRingArea?: number;
-    precision?: number;
-    patchCore?: number;
-    patchEdge?: number;
-    patchMin?: number;
-    edgeT?: number;
-    softBlobs?: number;
-    softSpread?: number;
-    meshCells?: number;
-    meshBlur?: number;
-    meshTol?: number;
-    patchFeather?: number;
+    detail?: number;
+    smoothness?: number;
 }
 
 type RequiredSVGOptions = Required<SVGOptions>;
@@ -59,19 +14,28 @@ interface ImageDataLike {
     height: number;
 }
 
+/** Internal tolerances, all derived from the options and the image (see `derive`). */
+interface Params {
+    minRegionArea: number;
+    expand: number;
+    flatTol: number;
+    stopTol: number;
+    maxStops: number;
+    bins: number;
+    curveTol: number;
+    cornerAngle: number;
+    cornerWindow: number;
+    minRingArea: number;
+    edgeT: number;
+}
+
 interface PathItem {
     d: string;
     fill: string;
-    /** Extra markup painted right after the path (soft blob layers, clipped to the path). */
-    extra?: string;
-    /** Soft edge (blur sigma in px) for refinement patches, so they melt into what is underneath. */
-    feather?: number;
-    /** Mask bounding box [x, y, w, h]; the feather filter region is derived from it. */
-    box?: [number, number, number, number];
 }
 
 interface RenderContext {
-    o: RequiredSVGOptions;
+    p: Params;
     w: number;
     h: number;
     lab: Float32Array;
@@ -80,9 +44,10 @@ interface RenderContext {
     inkLabels: Int32Array;
     labels: Int32Array;
     fmt: (v: number) => string;
+    fmtT: (v: number) => string;
     defs: string[];
     gradCount: number;
-    rank?: Int32Array;
+    rank: Int32Array;
 }
 
 export interface ColorProfile {
@@ -118,7 +83,7 @@ export const OPTIONS: { [K in keyof SVGOptions]-?: OptionSpec } = {
         max: 8192,
         integer: true,
         description:
-            "Longest side, in pixels, of the working image. Larger inputs are box-downscaled to this size before analysis; the SVG viewBox follows the working size while width/height keep the original size. Higher = more detail but slower and more memory.",
+            "Longest side, in pixels, of the working image. Larger inputs are box-downscaled to this size before analysis; the SVG viewBox follows the working size while width/height keep the original size. Higher = more detail but slower.",
     },
     alphaCutoff: {
         label: "Alpha cutoff",
@@ -135,207 +100,23 @@ export const OPTIONS: { [K in keyof SVGOptions]-?: OptionSpec } = {
         min: 0,
         max: 0.6,
         description:
-            "OKLab lightness below which a pixel counts as solid 'ink' (outlines, black spots). Ink is traced as its own top layer. Dark-but-not-black areas such as dark hair should stay above this so they remain gradient regions. Raise it to treat more dark colors as ink.",
+            "OKLab lightness below which a pixel counts as solid 'ink' (outlines, black spots). Ink is traced as its own top layer. Raise it to treat more dark colors as ink; set 0 to disable.",
     },
-    minRegionArea: {
-        label: "Min region area",
-        default: 12,
-        min: 1,
-        max: 500,
-        integer: true,
-        description:
-            "Smallest region or ink component, in pixels, that is kept. Smaller components are dropped or absorbed into a neighbour. Raise it to remove specks and noise, lower it to keep tiny details.",
-    },
-    expand: {
-        label: "Overlap",
-        default: 2,
+    detail: {
+        label: "Detail",
+        default: 0.5,
         min: 0,
-        max: 8,
-        integer: true,
+        max: 1,
         description:
-            "How many pixels each region is grown underneath the regions painted after it (and under the ink). Hides anti-aliasing seams between neighbouring shapes. Too high wastes work, 0 may show hairline gaps.",
+            "How faithfully colors and shapes are followed. Low = fewer regions, flatter fills, fewer gradient stops (small files). High = more regions and subtle shading (larger files). Edge sensitivity and color tolerances are all derived from this.",
     },
-    flatTol: {
-        label: "Flat fill tolerance",
-        default: 0.012,
+    smoothness: {
+        label: "Smoothness",
+        default: 0.5,
         min: 0,
-        max: 0.1,
+        max: 1,
         description:
-            "OKLab RMS error below which a region is painted as a single flat color instead of a gradient. Raise it for fewer gradients and smaller files, lower it to keep subtle shading.",
-    },
-    splitTol: {
-        label: "Split tolerance",
-        default: 0.035,
-        min: 0,
-        max: 0.2,
-        description:
-            "OKLab RMS error above which a poorly fitted region, with no clear patches to refit, is split in two by 2-means clustering and each half is refit.",
-    },
-    maxDepth: {
-        label: "Refinement depth",
-        default: 3,
-        min: 0,
-        max: 6,
-        integer: true,
-        description:
-            "Maximum number of recursive refinements (patches or splits painted on top of a region). 0 disables refinement entirely. Higher = more accurate highlights and shading but more paths.",
-    },
-    minSplitArea: {
-        label: "Min refine area",
-        default: 150,
-        min: 1,
-        max: 10000,
-        integer: true,
-        description:
-            "Regions smaller than this many pixels are never refined or split. Raise it to keep small regions simple.",
-    },
-    bins: {
-        label: "Gradient bins",
-        default: 32,
-        min: 4,
-        max: 128,
-        integer: true,
-        description:
-            "Number of bins in the 1D color profile used to fit gradient stops. More bins follow the shading more closely but are noisier on small regions.",
-    },
-    stopTol: {
-        label: "Stop tolerance",
-        default: 0.008,
-        min: 0,
-        max: 0.1,
-        description:
-            "Maximum OKLab error allowed when dropping gradient stops. Raise it for fewer stops and smaller files, lower it for smoother, more faithful gradients.",
-    },
-    maxStops: {
-        label: "Max gradient stops",
-        default: 6,
-        min: 2,
-        max: 16,
-        integer: true,
-        description: "Maximum number of color stops in a single gradient.",
-    },
-    curveTol: {
-        label: "Curve tolerance",
-        default: 0.8,
-        min: 0.1,
-        max: 5,
-        description:
-            "Bezier fitting tolerance in pixels. Lower = paths follow the shape more tightly (more segments), higher = smoother, simpler paths.",
-    },
-    cornerAngle: {
-        label: "Corner angle",
-        default: 50,
-        min: 10,
-        max: 170,
-        description:
-            "Turning angle in degrees above which a point on an outline is kept as a sharp corner instead of being smoothed. Lower = more corners, higher = rounder shapes.",
-    },
-    cornerWindow: {
-        label: "Corner window",
-        default: 4,
-        min: 2,
-        max: 12,
-        integer: true,
-        description:
-            "Number of outline points on each side used to measure the turning angle when detecting corners. Larger values ignore pixel-level jitter but can miss tight corners.",
-    },
-    minRingArea: {
-        label: "Min contour area",
-        default: 3,
-        min: 0,
-        max: 100,
-        description:
-            "Contours enclosing less than this area (in px²) are dropped from the path data. Raise it to discard tiny holes and islands.",
-    },
-    precision: {
-        label: "Decimal precision",
-        default: 2,
-        min: 0,
-        max: 6,
-        integer: true,
-        description:
-            "Number of decimals written in path coordinates and gradient values. Lower = smaller files, higher = more exact geometry.",
-    },
-    patchCore: {
-        label: "Patch threshold",
-        default: 0.03,
-        min: 0.01,
-        max: 0.5,
-        description:
-            "OKLab error at which a pixel counts as clearly mis-fitted by its region's gradient. Such pixels seed a patch that is refit and painted on top. Lower = more patches (more detail, more paths).",
-    },
-    patchEdge: {
-        label: "Patch spread",
-        default: 0.012,
-        min: 0.005,
-        max: 0.5,
-        description:
-            "A patch grows outward from its seed pixels until the error falls below this value, so its seam with the parent region is invisible. Should be lower than patchCore.",
-    },
-    patchMin: {
-        label: "Min patch size",
-        default: 30,
-        min: 1,
-        max: 500,
-        integer: true,
-        description:
-            "Minimum number of seed pixels (error above patchCore) a patch needs to be created. Raise it to ignore small mis-fitted spots.",
-    },
-    edgeT: {
-        label: "Edge threshold",
-        default: 0.02,
-        min: 0.002,
-        max: 0.2,
-        description:
-            "OKLab color change per pixel above which a pixel is a hard edge. Hard edges separate regions, so highlights, strands and shapes get their own region. Lower = more, smaller regions (more detail, risk of fragmenting noisy images). Higher = fewer, larger regions.",
-    },
-    softBlobs: {
-        label: "Soft blobs",
-        default: 24,
-        min: 0,
-        max: 128,
-        integer: true,
-        description:
-            "Maximum number of soft, feathered color blobs layered on top of a region's base gradient to reproduce smooth multi-color shading (mesh-gradient look). Blobs fade to transparent at their rim and are clipped to the region, so they never show seams. 0 disables this and falls back to hard-edged patches/splits.",
-    },
-    softSpread: {
-        label: "Soft spread",
-        default: 1.6,
-        min: 0.8,
-        max: 4,
-        description:
-            "Blob radius relative to the grid cell it was fitted on. Higher = wider, softer, more overlapping blends; lower = tighter, more local color spots.",
-    },
-    meshCells: {
-        label: "Mesh grid size",
-        default: 16,
-        min: 0,
-        max: 64,
-        integer: true,
-        description:
-            "Max grid cells along the longer side of a region for blurred colour-mesh shading. 0 disables it (falls back to soft blobs). The grid starts coarse and is refined until Mesh tolerance is met.",
-    },
-    meshBlur: {
-        label: "Mesh blur",
-        default: 0.7,
-        min: 0.4,
-        max: 1.5,
-        description: "Gaussian blur radius in grid cells. Higher = smoother blends, lower = more local colour control.",
-    },
-    meshTol: {
-        label: "Mesh tolerance",
-        default: 0.01,
-        min: 0.002,
-        max: 0.1,
-        description: "RMS error (sRGB, 0-1) at which the grid stops being refined.",
-    },
-    patchFeather: {
-        label: "Patch feather",
-        default: 5,
-        min: 0,
-        max: 20,
-        description:
-            "Blur sigma, in pixels, applied to the edge of refinement patches (hard-edged shapes painted over the mesh). Higher = patches melt into the surrounding shading, lower = crisper edges. 0 keeps them hard.",
+            "How much outlines are simplified. Low = paths hug the pixels tightly (more curves). High = rounder, simpler paths with far fewer curves.",
     },
 };
 
@@ -353,6 +134,30 @@ export function resolveOptions(opts?: SVGOptions): RequiredSVGOptions {
         out[key] = spec.integer ? Math.round(v) : v;
     }
     return out as unknown as RequiredSVGOptions;
+}
+
+/**
+ * Turn the two sliders into concrete tolerances. Pixel-based values scale with the
+ * working image size, so the same settings behave alike on a 300px icon and a 3000px scan.
+ * `edgeT` is a base value; the main function raises it for noisy images.
+ */
+function derive(o: RequiredSVGOptions, w: number, h: number): Params {
+    const s = Math.min(3, Math.max(0.6, Math.max(w, h) / 1000));
+    const k = 2 ** (1 - 2 * o.detail);
+    const sm = 2 ** (2 * o.smoothness - 1);
+    return {
+        minRegionArea: Math.max(4, Math.round(7.5 * s * s)),
+        expand: Math.min(4, Math.max(1, Math.round(1.6 * s))),
+        flatTol: 0.012 * k,
+        stopTol: 0.008 * k,
+        maxStops: 6,
+        bins: 32,
+        curveTol: 0.64 * Math.max(1.25, s) * sm,
+        cornerAngle: 50,
+        cornerWindow: Math.min(12, Math.max(2, Math.round(3.2 * s))),
+        minRingArea: 2.4 * s * s,
+        edgeT: 0.02 * Math.sqrt(k),
+    };
 }
 
 /* ------------------------------------------------------------------ color */
@@ -637,7 +442,632 @@ function fitCubic(pts: number[][], t1: number[], t2: number[], tolSq: number, ou
     fitCubic(pts.slice(sp), mul(center, -1), t2, tolSq, out);
 }
 
-function ringToBeziers(ring: number[][], o: RequiredSVGOptions): number[][][] | null {
+/* ------------------------------------------------ segment fitting (lines + cubics) */
+
+/** One piece of an outline: a straight line (`line`) or a cubic Bézier. `p` always holds 4 points. */
+interface Seg {
+    line: boolean;
+    p: number[][];
+    pts: number[][];
+    smooth: boolean;
+}
+
+const rot = (v: number[], a: number): [number, number] => {
+    const c = Math.cos(a),
+        s = Math.sin(a);
+    return [v[0] * c - v[1] * s, v[0] * s + v[1] * c];
+};
+const cross = (a: number[], b: number[]): number => a[0] * b[1] - a[1] * b[0];
+
+/** Largest distance of any point to the infinite line through the first and last point. */
+function lineDevSq(pts: number[][]): number {
+    const a = pts[0],
+        b = pts[pts.length - 1];
+    const d = sub(b, a);
+    const l = len(d);
+    if (!l) return Infinity;
+    let m = 0;
+    for (let i = 1; i < pts.length - 1; i++) {
+        const c = cross(d, sub(pts[i], a)) / l;
+        if (c * c > m) m = c * c;
+    }
+    return m;
+}
+
+/** Squared distance from a point to the segment (a, b). */
+function segDistSq(px: number, py: number, ax: number, ay: number, bx: number, by: number): number {
+    const dx = bx - ax,
+        dy = by - ay;
+    const l2 = dx * dx + dy * dy;
+    let t = l2 ? ((px - ax) * dx + (py - ay) * dy) / l2 : 0;
+    t = t < 0 ? 0 : t > 1 ? 1 : t;
+    const qx = ax + t * dx - px,
+        qy = ay + t * dy - py;
+    return qx * qx + qy * qy;
+}
+
+/**
+ * Largest squared distance from the (ordered) points to the curve. Uses true point-to-curve
+ * distance, not parametric error, so a curve is judged by how close it really runs to the outline.
+ */
+function maxDistSq(b: number[][], pts: number[][], stride: number): number {
+    const ctrl = len(sub(b[1], b[0])) + len(sub(b[2], b[1])) + len(sub(b[3], b[2]));
+    const M = Math.min(300, Math.max(16, Math.ceil(ctrl / 2)));
+    const S = new Float64Array(2 * (M + 1));
+    for (let i = 0; i <= M; i++) {
+        const q = bezAt(b, i / M);
+        S[2 * i] = q[0];
+        S[2 * i + 1] = q[1];
+    }
+    const n = pts.length;
+    let worst = 0,
+        j0 = 0,
+        first = true;
+    for (let k = 0; k < n; k += k + stride >= n && k !== n - 1 ? n - 1 - k : stride) {
+        const p = pts[k];
+        let jm = 0,
+            dm = Infinity;
+        const from = first ? 0 : Math.max(0, j0 - 2);
+        for (let j = from; j < M; j++) {
+            const d = segDistSq(p[0], p[1], S[2 * j], S[2 * j + 1], S[2 * j + 2], S[2 * j + 3]);
+            if (d < dm) {
+                dm = d;
+                jm = j;
+            } else if (!first && j - jm > 8) break;
+        }
+        first = false;
+        j0 = jm;
+        if (dm > worst) worst = dm;
+        if (k === n - 1) break;
+    }
+    return worst;
+}
+
+/** Plain Nelder-Mead minimiser (few dimensions, few iterations). */
+function nmN(fn: (x: number[]) => number, x0: number[], steps: number[], iters: number): { x: number[]; v: number } {
+    const dim = x0.length;
+    let S = [x0, ...x0.map((_, i) => x0.map((v, k) => (k === i ? v + steps[i] : v)))].map((p) => ({ p, v: fn(p) }));
+    for (let it = 0; it < iters; it++) {
+        S.sort((a, b) => a.v - b.v);
+        const c = new Array(dim).fill(0);
+        for (let i = 0; i < dim; i++) for (let k = 0; k < dim; k++) c[k] += S[i].p[k] / dim;
+        const w = S[dim];
+        const xr = c.map((v, k) => 2 * v - w.p[k]);
+        const fr = fn(xr);
+        if (fr < S[0].v) {
+            const xe = c.map((v, k) => 3 * v - 2 * w.p[k]);
+            const fe = fn(xe);
+            S[dim] = fe < fr ? { p: xe, v: fe } : { p: xr, v: fr };
+        } else if (fr < S[dim - 1].v) S[dim] = { p: xr, v: fr };
+        else {
+            const xc = c.map((v, k) => (v + w.p[k]) / 2);
+            const fc = fn(xc);
+            if (fc < w.v) S[dim] = { p: xc, v: fc };
+            else {
+                const b0 = S[0].p;
+                S = S.map((s, i) => {
+                    if (!i) return s;
+                    const p = s.p.map((v, k) => (v + b0[k]) / 2);
+                    return { p, v: fn(p) };
+                });
+            }
+        }
+    }
+    S.sort((a, b) => a.v - b.v);
+    return { x: S[0].p, v: S[0].v };
+}
+
+/**
+ * Cubic through `pts` that stays as close as possible to all of them. Starts from the least-squares
+ * (Schneider) solution, then, if that is not already clearly good, tunes the two handle lengths and
+ * (for free ends) the two end tangents to minimise the worst-case distance.
+ * Returns null when it is hopeless (so callers can reject long runs cheaply).
+ */
+function fitCubicFit(
+    pts: number[][],
+    t1: number[],
+    t2: number[],
+    free1: boolean,
+    free2: boolean,
+    tolSq: number,
+    lim2 = 0.35
+): { b: number[][]; err: number } | null {
+    const n = pts.length;
+    const p0 = pts[0],
+        p3 = pts[n - 1];
+    const L = Math.max(1e-6, Math.sqrt(sqd(p0, p3)));
+    let u = chordParams(pts);
+    let b = generateBezier(pts, u, t1, t2);
+    for (let r = 0; r < 2; r++) {
+        u = reparam(b, pts, u);
+        b = generateBezier(pts, u, t1, t2);
+    }
+    const stride = Math.max(1, Math.floor(n / 90));
+    const e = maxDistSq(b, pts, 1);
+    if (e < tolSq * 0.15) return { b, err: e };
+    if (e > tolSq * 36) return null;
+
+    const a1 = len(sub(b[1], p0)),
+        a2 = len(sub(b[2], p3));
+    const LIM = 0.35;
+    const build = (x: number[]): number[][] => {
+        const ta = free1 ? rot(t1, x[2]) : t1;
+        const tb = free2 ? rot(t2, x[free1 ? 3 : 2]) : t2;
+        return [p0, add(p0, mul(ta, x[0])), add(p3, mul(tb, x[1])), p3];
+    };
+    const cost = (x: number[]): number => {
+        if (x[0] < 0.02 * L || x[1] < 0.02 * L || x[0] > 1.5 * L || x[1] > 1.5 * L) return 1e12;
+        let q = 2;
+        if (free1) {
+            if (Math.abs(x[q++]) > LIM) return 1e12;
+        }
+        if (free2 && Math.abs(x[q]) > lim2) return 1e12;
+        return maxDistSq(build(x), pts, stride);
+    };
+    const x0 = [a1, a2];
+    const st = [0.08 * L, 0.08 * L];
+    if (free1) {
+        x0.push(0);
+        st.push(0.04);
+    }
+    if (free2) {
+        x0.push(0);
+        st.push(0.04);
+    }
+    const r = nmN(cost, x0, st, 80 + 30 * x0.length);
+    const nb = build(r.x);
+    const ne = maxDistSq(nb, pts, 1);
+    return ne < e ? { b: nb, err: ne } : { b, err: e };
+}
+
+/**
+ * Cover an open run of points with as few cubics as possible (the longest ones that stay inside
+ * the tolerance). Pieces too short to curve (fewer than 3 points) become lines.
+ *   t1 / t2: tangent at the start (pointing forward) and end (pointing backward), `fixed` = exact.
+ */
+function fitCurvesGreedy(
+    pts: number[][],
+    t1: number[],
+    t1Fixed: boolean,
+    t2: number[],
+    t2Fixed: boolean,
+    tolSq: number,
+    K: number
+): Seg[] {
+    const last = pts.length - 1;
+    const out: Seg[] = [];
+    let i = 0;
+    let fwd = t1;
+    let fwdFixed = t1Fixed;
+
+    const tangentAt = (j: number): number[] => {
+        const w = Math.max(K, 12);
+        const a = Math.max(0, j - w),
+            b = Math.min(last, j + w);
+        return unit(sub(pts[a], pts[b]));
+    };
+
+    const tryJ = (a: number, j: number): Seg | null => {
+        const sl = pts.slice(a, j + 1);
+        const endFixed = j === last && t2Fixed;
+        if (sl.length < 3) {
+            const p0 = sl[0],
+                p3 = sl[sl.length - 1];
+            return { line: true, p: [p0, p0, p3, p3], pts: sl, smooth: j < last || endFixed };
+        }
+        const endT = j === last ? t2 : tangentAt(j);
+        const f = fitCubicFit(sl, fwd, endT, !fwdFixed, !endFixed, tolSq, j === last ? 0.35 : 0.08);
+        if (!f || f.err >= tolSq) return null;
+        return { line: false, p: f.b, pts: sl, smooth: j < last || endFixed };
+    };
+
+    while (i < last) {
+        let ok = Math.min(last, i + 1);
+        let best = tryJ(i, ok);
+        if (!best) {
+            const p0 = pts[i],
+                p3 = pts[ok];
+            best = { line: true, p: [p0, p0, p3, p3], pts: [p0, p3], smooth: ok < last };
+        }
+        let step = 8;
+        let fail = -1;
+        while (ok < last) {
+            const j = Math.min(last, i + step);
+            const r = tryJ(i, j);
+            if (r) {
+                best = r;
+                ok = j;
+                if (j === last) break;
+                step *= 2;
+            } else {
+                fail = j;
+                break;
+            }
+        }
+        if (fail > 0) {
+            let lo = ok,
+                hi = fail;
+            while (hi - lo > 3) {
+                const mid = (lo + hi) >> 1;
+                const r = tryJ(i, mid);
+                if (r) {
+                    best = r;
+                    lo = mid;
+                } else hi = mid;
+            }
+            ok = lo;
+        }
+        if (ok < last && last - ok <= 10) {
+            const r = tryJ(i, last);
+            if (r) {
+                best = r;
+                ok = last;
+            }
+        }
+        out.push(best);
+        i = ok;
+        fwd = best.line ? unit(sub(best.p[3], best.p[0])) : unit(sub(best.p[3], best.p[2]));
+        fwdFixed = true;
+    }
+    return out;
+}
+
+/**
+ * Fit with the fewest cubics. The greedy pass finds how many are needed; then the points are dealt
+ * out evenly between that many pieces, which fit far tighter than "one long piece + a short rest"
+ * (and so show no kinks at the joins). Falls back to the greedy result if the even split does not fit.
+ */
+function fitCurves(
+    pts: number[][],
+    t1: number[],
+    t1Fixed: boolean,
+    t2: number[],
+    t2Fixed: boolean,
+    tolSq: number,
+    K: number
+): Seg[] {
+    const greedy = fitCurvesGreedy(pts, t1, t1Fixed, t2, t2Fixed, tolSq, K);
+    const n = greedy.length;
+    if (n < 2 || greedy.some((g) => g.line)) return greedy;
+    const last = pts.length - 1;
+    const cum = new Float64Array(last + 1);
+    for (let i = 1; i <= last; i++) cum[i] = cum[i - 1] + Math.sqrt(sqd(pts[i], pts[i - 1]));
+    const w = Math.max(K, 12);
+    const tanAt = (j: number): number[] => unit(sub(pts[Math.max(0, j - w)], pts[Math.min(last, j + w)]));
+    const minChord = 6 * Math.sqrt(tolSq);
+    const real = greedy.filter((g) => Math.hypot(g.p[3][0] - g.p[0][0], g.p[3][1] - g.p[0][1]) >= minChord).length;
+    for (let m = Math.max(1, real); m <= real; m++) {
+        const cut = [0];
+        for (let q = 1; q < m; q++) {
+            let j = cut[q - 1] + 1;
+            const target = (cum[last] * q) / m;
+            while (j < last && cum[j] < target) j++;
+            cut.push(j);
+        }
+        cut.push(last);
+        const out: Seg[] = [];
+        let ok = true;
+        for (let q = 0; q < m && ok; q++) {
+            const a = cut[q],
+                b = cut[q + 1];
+            if (b - a < 3) {
+                ok = false;
+                break;
+            }
+            const sl = pts.slice(a, b + 1);
+            const fwd = q === 0 ? t1 : mul(tanAt(a), -1);
+            const bwd = q === m - 1 ? t2 : tanAt(b);
+            const f = fitCubicFit(
+                sl,
+                fwd,
+                bwd,
+                q === 0 && !t1Fixed,
+                q === m - 1 && !t2Fixed,
+                tolSq,
+                q === m - 1 ? 0.35 : 0.0
+            );
+            if (!f || f.err >= tolSq) ok = false;
+            else out.push({ line: false, p: f.b, pts: sl, smooth: q < m - 1 || t2Fixed });
+        }
+        if (ok) return out;
+    }
+    return greedy;
+}
+
+/** Is the whole piece one straight line? Judged on its interior; the ends may be rounded by the trace. */
+function isStraightPiece(pts: number[][], tolSq: number, stub: number): boolean {
+    const last = pts.length - 1;
+    if (last < 4 * stub) return lineDevSq(pts) < 0.36 * tolSq;
+    const a = pts[stub],
+        b = pts[last - stub];
+    const dx = b[0] - a[0],
+        dy = b[1] - a[1];
+    const l = Math.hypot(dx, dy);
+    if (!l) return false;
+    for (let k = 0; k <= last; k++) {
+        const c = (dx * (pts[k][1] - a[1]) - dy * (pts[k][0] - a[0])) / l;
+        const lim = k < stub || k > last - stub ? 6.25 * tolSq : 0.36 * tolSq;
+        if (c * c > lim) return false;
+    }
+    return true;
+}
+
+/**
+ * Longest straight stretches of an open run: stretches that are both long and very straight
+ * (far straighter than the curve tolerance), so gentle arcs are never chopped into polylines.
+ */
+function findLineRuns(pts: number[][], tolSq: number, minLen: number): [number, number][] {
+    const last = pts.length - 1;
+    const cum = new Float64Array(last + 1);
+    for (let i = 1; i <= last; i++) cum[i] = cum[i - 1] + Math.sqrt(sqd(pts[i], pts[i - 1]));
+    const devSq = Math.max(0.0225, 0.0625 * tolSq);
+    const dev = (a: number, b: number): number => {
+        const dx = pts[b][0] - pts[a][0],
+            dy = pts[b][1] - pts[a][1];
+        const l = Math.hypot(dx, dy);
+        if (!l) return Infinity;
+        let m = 0;
+        for (let k = a + 1; k < b; k++) {
+            const c = (dx * (pts[k][1] - pts[a][1]) - dy * (pts[k][0] - pts[a][0])) / l;
+            if (c * c > m) m = c * c;
+        }
+        return m;
+    };
+    const out: [number, number][] = [];
+    let i = 0;
+    while (i < last) {
+        let ok = i,
+            step = 16,
+            fail = -1;
+        while (ok < last) {
+            const j = Math.min(last, i + step);
+            if (dev(i, j) <= devSq) {
+                ok = j;
+                if (j === last) break;
+                step *= 2;
+            } else {
+                fail = j;
+                break;
+            }
+        }
+        if (fail > 0) {
+            let lo = ok,
+                hi = fail;
+            while (hi - lo > 1) {
+                const mid = (lo + hi) >> 1;
+                if (dev(i, mid) <= devSq) lo = mid;
+                else hi = mid;
+            }
+            ok = lo;
+        }
+        if (ok > i && cum[ok] - cum[i] >= minLen) {
+            out.push([i, ok]);
+            i = ok;
+        } else i += 6;
+    }
+    return out;
+}
+
+/**
+ * Fit an open run of points: exact straight lines where the outline is straight, and the fewest
+ * smooth cubics in between (which leave and join each line along its direction).
+ */
+function fitRun(
+    pts: number[][],
+    t1: number[],
+    t1Fixed: boolean,
+    t2: number[],
+    t2Fixed: boolean,
+    tolSq: number,
+    K: number
+): Seg[] {
+    const last = pts.length - 1;
+    if (last >= 2 && !t1Fixed && !t2Fixed && isStraightPiece(pts, tolSq, Math.max(10, 3 * K))) {
+        const p0 = pts[0],
+            p3 = pts[last];
+        return [{ line: true, p: [p0, p0, p3, p3], pts, smooth: false }];
+    }
+    const runs = findLineRuns(pts, tolSq, 80 * Math.sqrt(tolSq));
+    const stub = Math.max(10, 3 * K);
+    if (runs.length) {
+        if (!t1Fixed && runs[0][0] <= stub) runs[0][0] = 0;
+        const R = runs[runs.length - 1];
+        if (!t2Fixed && last - R[1] <= stub) R[1] = last;
+    }
+    if (!runs.length) return fitCurves(pts, t1, t1Fixed, t2, t2Fixed, tolSq, K);
+    const out: Seg[] = [];
+    let pos = 0;
+    let tin = t1,
+        tinFixed = t1Fixed;
+    for (let r = 0; r <= runs.length; r++) {
+        const next = r < runs.length ? runs[r] : null;
+        const gapEnd = next ? next[0] : last;
+        if (gapEnd > pos) {
+            const lineDir = next ? unit(sub(pts[next[1]], pts[next[0]])) : t2;
+            const g = fitCurves(
+                pts.slice(pos, gapEnd + 1),
+                tin,
+                tinFixed,
+                next ? mul(lineDir, -1) : t2,
+                next ? true : t2Fixed,
+                tolSq,
+                K
+            );
+            out.push(...g);
+        }
+        if (!next) break;
+        const sl = pts.slice(next[0], next[1] + 1);
+        const p0 = sl[0],
+            p3 = sl[sl.length - 1];
+        const end = next[1] === last;
+        out.push({ line: true, p: [p0, p0, p3, p3], pts: sl, smooth: !end || t2Fixed });
+        tin = unit(sub(p3, p0));
+        tinFixed = true;
+        pos = next[1];
+    }
+    return out;
+}
+
+/** Tidy the joins: axis-aligned lines become exact, corners between lines become exact intersections. */
+function polishSegs(segs: Seg[], snap: number): void {
+    for (let k = 0; k < segs.length && segs.length > 3;) {
+        const s = segs[k];
+        if (Math.hypot(s.p[3][0] - s.p[0][0], s.p[3][1] - s.p[0][1]) >= snap * 4) {
+            k++;
+            continue;
+        }
+        const pi = (k - 1 + segs.length) % segs.length;
+        const prev = segs[pi];
+        const dx = s.p[3][0] - prev.p[3][0],
+            dy = s.p[3][1] - prev.p[3][1];
+        prev.p[3] = s.p[3];
+        prev.p[2] = prev.line ? prev.p[3] : [prev.p[2][0] + dx, prev.p[2][1] + dy];
+        prev.smooth = s.smooth;
+        segs.splice(k, 1);
+        if (pi > k) k = Math.max(0, k - 1);
+    }
+    const n = segs.length;
+    type L = { c: number[]; d: number[] };
+    const lines: (L | null)[] = segs.map((s) => {
+        if (!s.line) return null;
+        const pts = s.pts;
+        let cx = 0,
+            cy = 0;
+        for (const p of pts) {
+            cx += p[0];
+            cy += p[1];
+        }
+        cx /= pts.length;
+        cy /= pts.length;
+        let sxx = 0,
+            sxy = 0,
+            syy = 0;
+        for (const p of pts) {
+            const dx = p[0] - cx,
+                dy = p[1] - cy;
+            sxx += dx * dx;
+            sxy += dx * dy;
+            syy += dy * dy;
+        }
+        const th = 0.5 * Math.atan2(2 * sxy, sxx - syy);
+        let d: number[] = [Math.cos(th), Math.sin(th)];
+        const fw = sub(s.p[3], s.p[0]);
+        if (dot(d, fw) < 0) d = [-d[0], -d[1]];
+        const L = len(fw);
+        const tolA = Math.max(0.0105, Math.min(0.04, snap / Math.max(L, 1)));
+        if (Math.abs(d[1]) < tolA) d = [Math.sign(d[0]) || 1, 0];
+        else if (Math.abs(d[0]) < tolA) d = [0, Math.sign(d[1]) || 1];
+        return { c: [cx, cy], d };
+    });
+
+    const project = (l: L, p: number[]): [number, number] => {
+        const t = dot(sub(p, l.c), l.d);
+        return [l.c[0] + l.d[0] * t, l.c[1] + l.d[1] * t];
+    };
+    const moveJoint = (k: number, P: number[]) => {
+        const a = segs[k],
+            b = segs[(k + 1) % n];
+        const old = a.p[3];
+        const dx = P[0] - old[0],
+            dy = P[1] - old[1];
+        a.p[3] = P;
+        if (!a.line) a.p[2] = [a.p[2][0] + dx, a.p[2][1] + dy];
+        else a.p[2] = P;
+        b.p[0] = P;
+        if (!b.line) b.p[1] = [b.p[1][0] + dx, b.p[1][1] + dy];
+        else b.p[1] = P;
+    };
+
+    for (let k = 0; k < n; k++) {
+        const la = lines[k],
+            lb = lines[(k + 1) % n];
+        const P = segs[k].p[3];
+        if (la && lb) {
+            const den = cross(la.d, lb.d);
+            if (Math.abs(den) > 0.14) {
+                const t = cross(sub(lb.c, la.c), lb.d) / den;
+                const X: [number, number] = [la.c[0] + la.d[0] * t, la.c[1] + la.d[1] * t];
+                if (Math.hypot(X[0] - P[0], X[1] - P[1]) < snap * 4) {
+                    moveJoint(k, X);
+                    continue;
+                }
+            }
+            const Q = project(la, P);
+            if (Math.hypot(Q[0] - P[0], Q[1] - P[1]) < snap * 2) moveJoint(k, Q);
+        } else if (la || lb) {
+            const l = (la || lb)!;
+            const Q = project(l, P);
+            if (Math.hypot(Q[0] - P[0], Q[1] - P[1]) < snap * 2) moveJoint(k, Q);
+        }
+    }
+
+    for (let k = 0; k < n; k++) {
+        const a = segs[k],
+            b = segs[(k + 1) % n];
+        if (!a.smooth) continue;
+        const la = lines[k],
+            lb = lines[(k + 1) % n];
+        const P = a.p[3];
+        if (la && lb) continue;
+        let d: number[];
+        if (la) d = la.d;
+        else if (lb) d = lb.d;
+        else {
+            const da = unit(sub(P, a.p[2])),
+                db = unit(sub(b.p[1], P));
+            d = unit(add(da, db));
+            if (!d[0] && !d[1]) continue;
+        }
+        if (!a.line) {
+            const l = len(sub(P, a.p[2]));
+            a.p[2] = [P[0] - d[0] * l, P[1] - d[1] * l];
+        }
+        if (!b.line) {
+            const l = len(sub(b.p[1], P));
+            b.p[1] = [P[0] + d[0] * l, P[1] + d[1] * l];
+        }
+    }
+}
+
+/**
+ * Gaussian-smooth an open run of points, keeping both end points fixed (odd reflection at the ends,
+ * so the end tangents survive). Removes pixel-level jitter so lines and arcs come out clean.
+ */
+function smoothRun(pts: number[][], sigma: number): number[][] {
+    const n = pts.length;
+    const r = Math.ceil(2.5 * sigma);
+    if (n < 2 * r + 3) return pts;
+    const wts: number[] = [];
+    let ws = 0;
+    for (let d = -r; d <= r; d++) {
+        const w = Math.exp(-(d * d) / (2 * sigma * sigma));
+        wts.push(w);
+        ws += w;
+    }
+    const at = (i: number): number[] => {
+        if (i < 0) return [2 * pts[0][0] - pts[-i][0], 2 * pts[0][1] - pts[-i][1]];
+        if (i > n - 1) {
+            const j = 2 * (n - 1) - i;
+            return [2 * pts[n - 1][0] - pts[j][0], 2 * pts[n - 1][1] - pts[j][1]];
+        }
+        return pts[i];
+    };
+    const out: number[][] = [pts[0]];
+    for (let i = 1; i < n - 1; i++) {
+        let x = 0,
+            y = 0;
+        for (let d = -r; d <= r; d++) {
+            const p = at(i + d);
+            x += wts[d + r] * p[0];
+            y += wts[d + r] * p[1];
+        }
+        out.push([x / ws, y / ws]);
+    }
+    out.push(pts[n - 1]);
+    return out;
+}
+
+function ringToSegs(ring: number[][], o: Params): Seg[] | null {
     const n = ring.length;
     if (n < 4) return null;
     const k = Math.max(2, Math.min(o.cornerWindow, (n / 6) | 0));
@@ -672,26 +1102,42 @@ function ringToBeziers(ring: number[][], o: RequiredSVGOptions): number[][][] | 
         breaks.sort((a, b) => a.i - b.i);
     }
 
-    const tolSq = o.curveTol * o.curveTol;
-    const out: number[][][] = [];
+    let bx0 = Infinity,
+        by0 = Infinity,
+        bx1 = -Infinity,
+        by1 = -Infinity;
+    for (const p of ring) {
+        if (p[0] < bx0) bx0 = p[0];
+        if (p[0] > bx1) bx1 = p[0];
+        if (p[1] < by0) by0 = p[1];
+        if (p[1] > by1) by1 = p[1];
+    }
+    const diag = Math.hypot(bx1 - bx0, by1 - by0);
+    const tol = Math.min(o.curveTol, Math.max(0.2, 0.002 * diag));
+    const tolSq = tol * tol;
+    const all: Seg[] = [];
     for (let q = 0; q < breaks.length; q++) {
         const A = breaks[q],
             B = breaks[(q + 1) % breaks.length];
-        const seg = [];
+        const seg: number[][] = [];
         let i = A.i;
         do {
             seg.push(ring[i]);
             i = (i + 1) % n;
         } while (i !== B.i);
         seg.push(ring[B.i]);
+        if (seg.length < 2) continue;
         const kt = Math.min(k + 1, seg.length - 1);
         const t1 = A.corner ? unit(sub(seg[kt], seg[0])) : unit(sub(ring[(A.i + k) % n], ring[(A.i - k + n) % n]));
         const t2 = B.corner
             ? unit(sub(seg[seg.length - 1 - kt], seg[seg.length - 1]))
             : unit(sub(ring[(B.i - k + n) % n], ring[(B.i + k) % n]));
-        fitCubic(seg, t1, t2, tolSq, out);
+        const sm = smoothRun(seg, Math.max(1.2, 0.6 * o.cornerWindow));
+        all.push(...fitRun(sm, t1, !A.corner, t2, !B.corner, tolSq, Math.max(k, 4)));
     }
-    return out;
+    if (!all.length) return null;
+    polishSegs(all, tol);
+    return all;
 }
 
 function makeFmt(p: number): (v: number) => string {
@@ -703,22 +1149,35 @@ function makeFmt(p: number): (v: number) => string {
     };
 }
 
-function beziersToPath(bz: number[][][], fmt: (v: number) => string): string {
-    let d = "M" + fmt(bz[0][0][0]) + " " + fmt(bz[0][0][1]);
-    for (const b of bz) {
-        d +=
-            "C" +
-            fmt(b[1][0]) +
-            " " +
-            fmt(b[1][1]) +
-            " " +
-            fmt(b[2][0]) +
-            " " +
-            fmt(b[2][1]) +
-            " " +
-            fmt(b[3][0]) +
-            " " +
-            fmt(b[3][1]);
+function segsToPath(segs: Seg[], fmt: (v: number) => string): string {
+    let d = "M" + fmt(segs[0].p[0][0]) + " " + fmt(segs[0].p[0][1]);
+    let cx = fmt(segs[0].p[0][0]),
+        cy = fmt(segs[0].p[0][1]);
+    for (const s of segs) {
+        const ex = fmt(s.p[3][0]),
+            ey = fmt(s.p[3][1]);
+        if (s.line) {
+            if (ex === cx && ey === cy) continue;
+            if (ey === cy) d += "H" + ex;
+            else if (ex === cx) d += "V" + ey;
+            else d += "L" + ex + " " + ey;
+        } else {
+            d +=
+                "C" +
+                fmt(s.p[1][0]) +
+                " " +
+                fmt(s.p[1][1]) +
+                " " +
+                fmt(s.p[2][0]) +
+                " " +
+                fmt(s.p[2][1]) +
+                " " +
+                ex +
+                " " +
+                ey;
+        }
+        cx = ex;
+        cy = ey;
     }
     return d + "Z";
 }
@@ -846,7 +1305,7 @@ function maskToPath(
     by: number,
     imgW: number,
     imgH: number,
-    o: RequiredSVGOptions,
+    o: Params,
     fmt: (v: number) => string
 ): string {
     const f = new Float32Array(W * H);
@@ -883,15 +1342,15 @@ function fieldToPath(
     H: number,
     bx: number,
     by: number,
-    o: RequiredSVGOptions,
+    o: Params,
     fmt: (v: number) => string
 ): string {
     const rings = contourRings(f, W, H, bx, by, 0.5);
     let d = "";
     for (const ring of rings) {
         if (ring.length < 4 || ringArea(ring) < o.minRingArea) continue;
-        const bz = ringToBeziers(ring, o);
-        if (bz && bz.length) d += beziersToPath(bz, fmt);
+        const sg = ringToSegs(ring, o);
+        if (sg && sg.length) d += segsToPath(sg, fmt);
     }
     return d;
 }
@@ -956,7 +1415,7 @@ function nelderMead(fn: (p: number[]) => number, x0: number[], step: number, ite
     return pts[0];
 }
 
-function makeStops(prof: ColorProfile, mean: number[], B: number, o: RequiredSVGOptions) {
+function makeStops(prof: ColorProfile, mean: number[], B: number, o: Params) {
     const pts: { t: number; lab: number[]; rgb: [number, number, number] }[] = [];
     for (let b = 0; b < B; b++) {
         const c = prof.cnt[b];
@@ -997,8 +1456,21 @@ function makeStops(prof: ColorProfile, mean: number[], B: number, o: RequiredSVG
     return keep.map((k) => pts[k]);
 }
 
-function analyze(px: Int32Array, m: Uint8Array, bx: number, by: number, W: number, ctx: RenderContext) {
-    const { o, w, lab } = ctx;
+/**
+ * Pick the simplest fill that explains a region: flat color, else linear gradient,
+ * else radial gradient. Returns the `fill` attribute value (and registers any gradient in ctx.defs).
+ * Only interior pixels are used: boundary pixels are anti-aliased mixes of two regions.
+ */
+function fitFill(
+    px: Int32Array,
+    m: Uint8Array,
+    bx: number,
+    by: number,
+    W: number,
+    flatOnly: boolean,
+    ctx: RenderContext
+): string {
+    const { p, w, lab, fmt, fmtT } = ctx;
 
     let inner: number[] = [];
     for (let j = 0; j < px.length; j++) {
@@ -1025,22 +1497,16 @@ function analyze(px: Int32Array, m: Uint8Array, bx: number, by: number, W: numbe
     }
     for (let c = 0; c < 3; c++) mean[c] /= n;
     let sumSq = 0;
-    for (let j = 0; j < n; j++) {
+    for (let j = 0; j < n; j++)
         for (let c = 0; c < 3; c++) {
             cols[3 * j + c] -= mean[c];
             sumSq += cols[3 * j + c] ** 2;
         }
-    }
     const rmseFlat = Math.sqrt(sumSq / n);
-    const flat = {
-        fill: hex(oklabToRgb01(mean[0], mean[1], mean[2])),
-        rmse: rmseFlat,
-        errAt: (i: number) => Math.hypot(lab[3 * i] - mean[0], lab[3 * i + 1] - mean[1], lab[3 * i + 2] - mean[2]),
-        colAt: (_i: number): number[] => mean, // eslint-disable-line @typescript-eslint/no-unused-vars
-    };
-    if (n < 16 || rmseFlat < o.flatTol) return flat;
+    const flat = hex(oklabToRgb01(mean[0], mean[1], mean[2]));
+    if (flatOnly || n < 16 || rmseFlat < p.flatTol) return flat;
 
-    const B = o.bins;
+    const B = p.bins;
     const ts = new Float64Array(n);
     let mx = 0,
         my = 0;
@@ -1093,776 +1559,71 @@ function analyze(px: Int32Array, m: Uint8Array, bx: number, by: number, W: numbe
     }
 
     let rad: { prof: ColorProfile; cx: number; cy: number; err: number } | null = null;
-    {
+    if (!lin || Math.sqrt(Math.max(0, lin.err) / n) > p.flatTol) {
         const evalAt = (c: number[]) => {
             for (let j = 0; j < n; j++) ts[j] = Math.hypot(xs[j] - c[0], ys[j] - c[1]);
             return binProfile(ts, cols, n, B, sumSq).err;
         };
         let iMax = 0,
-            iMin = 0;
+            iMin = 0,
+            size = 0;
         for (let j = 0; j < n; j++) {
             if (cols[3 * j] > cols[3 * iMax]) iMax = j;
             if (cols[3 * j] < cols[3 * iMin]) iMin = j;
+            size = Math.max(size, Math.abs(xs[j] - mx), Math.abs(ys[j] - my));
         }
-        let size = 0;
-        for (let j = 0; j < n; j++) size = Math.max(size, Math.abs(xs[j] - mx), Math.abs(ys[j] - my));
-        let bestPos: number[] | null = null;
+        let best: { p: number[]; v: number } | null = null;
         for (const s of [
             [mx, my],
             [xs[iMax], ys[iMax]],
             [xs[iMin], ys[iMin]],
         ]) {
             const r = nelderMead(evalAt, s, Math.max(2, size * 0.15), 45);
-            if (!bestPos || evalAt(r.p) < evalAt(bestPos)) bestPos = r.p;
+            if (!best || r.v < best.v) best = r;
         }
-        if (bestPos) {
-            for (let j = 0; j < n; j++) ts[j] = Math.hypot(xs[j] - bestPos[0], ys[j] - bestPos[1]);
+        if (best) {
+            for (let j = 0; j < n; j++) ts[j] = Math.hypot(xs[j] - best.p[0], ys[j] - best.p[1]);
             const prof = binProfile(ts, cols, n, B, sumSq);
-            rad = { prof, cx: bestPos[0], cy: bestPos[1], err: prof.err };
+            rad = { prof, cx: best.p[0], cy: best.p[1], err: prof.err };
         }
     }
 
-    const cands = [lin && { kind: "lin", ...lin }, rad && { kind: "rad", ...rad }].filter(Boolean) as Array<{
-        kind: string;
-        prof: ColorProfile;
-        err: number;
-        dx?: number;
-        dy?: number;
-        cx?: number;
-        cy?: number;
-    }>;
-    cands.sort((a, b) => a.err - b.err);
-    let best = cands[0];
-    if (best && best.kind === "rad" && lin && lin.err < best.err * 1.1) {
-        const foundLin = cands.find((c) => c.kind === "lin");
-        if (foundLin) best = foundLin;
-    }
+    const useRad = rad && (!lin || rad.err < lin.err / 1.1);
+    const best = useRad ? rad! : lin;
     if (!best) return flat;
-
     const rmse = Math.sqrt(Math.max(0, best.err) / n);
-    if (rmseFlat - rmse < 0.004) return flat;
+    if (rmseFlat - rmse < p.flatTol * 0.35) return flat;
 
-    const stops = makeStops(best.prof, mean, B, o);
+    const stops = makeStops(best.prof, mean, B, p);
     if (stops.length < 2) return flat;
     const id = "g" + ctx.gradCount++;
-    let def = "";
-    const fmt = ctx.fmt;
-    if (best.kind === "lin" && best.dx !== undefined && best.dy !== undefined) {
-        const { tmin, tmax } = best.prof;
+    const stopTags = (off: (t: number) => number) =>
+        stops.map((s) => `<stop offset="${fmtT(off(s.t))}" stop-color="${hex(s.rgb)}"/>`).join("");
+    const { tmin, tmax, span } = best.prof;
+    if ("dx" in best) {
         const p1 = [mx + best.dx * tmin, my + best.dy * tmin];
         const p2 = [mx + best.dx * tmax, my + best.dy * tmax];
-        def =
-            `<linearGradient id="${id}" gradientUnits="userSpaceOnUse" x1="${fmt(p1[0])}" y1="${fmt(p1[1])}" x2="${fmt(p2[0])}" y2="${fmt(p2[1])}">` +
-            stops.map((s) => `<stop offset="${fmt(s.t)}" stop-color="${hex(s.rgb)}"/>`).join("") +
-            "</linearGradient>";
-    } else if (best.kind === "rad" && best.cx !== undefined && best.cy !== undefined) {
-        const { tmin, tmax, span } = best.prof;
-        if (tmax <= 0) return flat;
-        def =
-            `<radialGradient id="${id}" gradientUnits="userSpaceOnUse" cx="${fmt(best.cx)}" cy="${fmt(best.cy)}" r="${fmt(tmax)}">` +
-            stops
-                .map((s) => `<stop offset="${fmt((tmin + s.t * span) / tmax)}" stop-color="${hex(s.rgb)}"/>`)
-                .join("") +
-            "</radialGradient>";
-    }
-    ctx.defs.push(def);
-
-    const { tmin, span } = best.prof;
-    const LUT = new Float32Array(256 * 3);
-    for (let q = 0; q < 256; q++) {
-        const t = q / 255;
-        let a = stops[0],
-            b = stops[stops.length - 1];
-        if (t <= a.t) b = a;
-        else if (t >= b.t) a = b;
-        else
-            for (let k = 0; k + 1 < stops.length; k++)
-                if (t >= stops[k].t && t <= stops[k + 1].t) {
-                    a = stops[k];
-                    b = stops[k + 1];
-                    break;
-                }
-        const u = a === b ? 0 : (t - a.t) / (b.t - a.t);
-        const l = rgb01ToOklab(
-            a.rgb[0] + (b.rgb[0] - a.rgb[0]) * u,
-            a.rgb[1] + (b.rgb[1] - a.rgb[1]) * u,
-            a.rgb[2] + (b.rgb[2] - a.rgb[2]) * u
-        );
-        LUT[3 * q] = l[0];
-        LUT[3 * q + 1] = l[1];
-        LUT[3 * q + 2] = l[2];
-    }
-    const isLin = best.kind === "lin";
-    const colAt = (i: number): number[] => {
-        const x = (i % w) + 0.5,
-            y = ((i / w) | 0) + 0.5;
-        const t =
-            isLin && best.dx !== undefined && best.dy !== undefined
-                ? (x - mx) * best.dx + (y - my) * best.dy
-                : best.cx !== undefined && best.cy !== undefined
-                  ? Math.hypot(x - best.cx, y - best.cy)
-                  : 0;
-        let q = (((t - tmin) / span) * 255 + 0.5) | 0;
-        q = q < 0 ? 0 : q > 255 ? 255 : q;
-        return [LUT[3 * q], LUT[3 * q + 1], LUT[3 * q + 2]];
-    };
-    const errAt = (i: number) => {
-        const c = colAt(i);
-        return Math.hypot(lab[3 * i] - c[0], lab[3 * i + 1] - c[1], lab[3 * i + 2] - c[2]);
-    };
-    return { fill: `url(#${id})`, rmse, errAt, colAt };
-}
-
-/* ------------------------------------------------------------ soft layers */
-
-/**
- * Smooth multi-color shading ("mesh gradient" look) for one region.
- *
- * SVG has no mesh gradient, so we approximate it with feathered blobs: radial
- * gradients whose color is opaque in the middle and fades to transparent at the rim,
- * stacked on the region's base fill and clipped to the region outline.
- *
- * Greedy matching pursuit, coarse to fine: simulate what is painted so far, find the
- * grid cell where the image differs most from it, drop a blob there with the cell's
- * true color, update the simulation, repeat. Early blobs are big (broad color areas),
- * later ones small (local tweaks).
- */
-function softLayers(
-    px: Int32Array,
-    fit: { colAt: (i: number) => number[]; rmse: number },
-    clipD: string,
-    m: Uint8Array,
-    bx: number,
-    by: number,
-    W: number,
-    ctx: RenderContext
-): string {
-    const { o, w, lab, fmt } = ctx;
-    // Only fit interior pixels: boundary pixels are anti-aliased mixes of two regions
-    // and would drag blobs towards colors that don't belong to this region.
-    let src: ArrayLike<number> = px;
-    {
-        const inner: number[] = [];
-        for (let j = 0; j < px.length; j++) {
-            const i = px[j];
-            const k = (((i / w) | 0) - by) * W + ((i % w) - bx);
-            if (m[k - 1] && m[k + 1] && m[k - W] && m[k + W]) inner.push(i);
-        }
-        if (inner.length >= 24) src = inner;
-    }
-    const stride = Math.max(1, Math.ceil(src.length / 4000));
-    const n = Math.ceil(src.length / stride);
-    const xs = new Float32Array(n),
-        ys = new Float32Array(n),
-        tgt = new Float32Array(n * 3),
-        cur = new Float32Array(n * 3);
-    let x0 = Infinity,
-        y0 = Infinity,
-        x1 = -Infinity,
-        y1 = -Infinity;
-    for (let j = 0; j < n; j++) {
-        const i = src[j * stride];
-        xs[j] = (i % w) + 0.5;
-        ys[j] = ((i / w) | 0) + 0.5;
-        const c = fit.colAt(i);
-        for (let k = 0; k < 3; k++) {
-            tgt[3 * j + k] = lab[3 * i + k];
-            cur[3 * j + k] = c[k];
-        }
-        if (xs[j] < x0) x0 = xs[j];
-        if (xs[j] > x1) x1 = xs[j];
-        if (ys[j] < y0) y0 = ys[j];
-        if (ys[j] > y1) y1 = ys[j];
-    }
-    const size = Math.max(x1 - x0, y1 - y0, 1);
-    // Small regions need few blobs; the budget grows with the region's size.
-    const K = Math.max(1, Math.min(o.softBlobs, Math.round(Math.sqrt(src.length) / 8)));
-    // Opacity falloff across the blob radius: raised cosine, 0 at the rim.
-    const OFFS = [0, 0.25, 0.5, 0.75, 1];
-    const fall = (t: number): number => (t >= 1 ? 0 : 0.5 * (1 + Math.cos(Math.PI * t)));
-
-    let markup = "";
-    let fails = 0;
-    for (let k = 0; k < K; k++) {
-        const cell = size / (4 + (10 * k) / K);
-        const gw = Math.floor((x1 - x0) / cell) + 1,
-            gh = Math.floor((y1 - y0) / cell) + 1;
-        const cnt = new Float64Array(gw * gh),
-            res = new Float64Array(gw * gh * 3),
-            tg = new Float64Array(gw * gh * 3),
-            sx = new Float64Array(gw * gh),
-            sy = new Float64Array(gw * gh);
-        for (let j = 0; j < n; j++) {
-            const g = Math.floor((ys[j] - y0) / cell) * gw + Math.floor((xs[j] - x0) / cell);
-            cnt[g]++;
-            sx[g] += xs[j];
-            sy[g] += ys[j];
-            for (let c = 0; c < 3; c++) {
-                res[3 * g + c] += tgt[3 * j + c] - cur[3 * j + c];
-                tg[3 * g + c] += tgt[3 * j + c];
-            }
-        }
-        // Cell with the biggest average error; sqrt(count) keeps tiny edge cells from winning.
-        let best = -1,
-            bestScore = 0,
-            bestMag = 0;
-        for (let g = 0; g < cnt.length; g++) {
-            if (cnt[g] < 3) continue;
-            const mag = Math.hypot(res[3 * g], res[3 * g + 1], res[3 * g + 2]) / cnt[g];
-            const score = mag * Math.sqrt(cnt[g]);
-            if (score > bestScore) {
-                bestScore = score;
-                best = g;
-                bestMag = mag;
-            }
-        }
-        if (best < 0 || bestMag < o.flatTol) break;
-
-        const cx = sx[best] / cnt[best],
-            cy = sy[best] / cnt[best];
-        const R = cell * o.softSpread;
-        // Least-squares blob color: minimises sum |target - (cur + a*(col - cur))|^2 over
-        // the blob's footprint, where a is the blob's opacity at each pixel.
-        const num = [0, 0, 0];
-        let den = 0;
-        for (let j = 0; j < n; j++) {
-            const t = Math.hypot(xs[j] - cx, ys[j] - cy) / R;
-            if (t >= 1) continue;
-            const a = fall(t);
-            den += a * a;
-            for (let c = 0; c < 3; c++) num[c] += a * (tgt[3 * j + c] - cur[3 * j + c] + a * cur[3 * j + c]);
-        }
-        if (den < 1e-9) {
-            if (++fails >= 3) break;
-            continue;
-        }
-        const col = [num[0] / den, num[1] / den, num[2] / den];
-        // Apply to a trial copy; keep the blob only if the total error really drops.
-        const trial = cur.slice();
-        let gain = 0;
-        for (let j = 0; j < n; j++) {
-            const t = Math.hypot(xs[j] - cx, ys[j] - cy) / R;
-            if (t >= 1) continue;
-            const a = fall(t);
-            let before = 0,
-                after = 0;
-            for (let c = 0; c < 3; c++) {
-                const nv = cur[3 * j + c] + (col[c] - cur[3 * j + c]) * a;
-                trial[3 * j + c] = nv;
-                before += (tgt[3 * j + c] - cur[3 * j + c]) ** 2;
-                after += (tgt[3 * j + c] - nv) ** 2;
-            }
-            gain += before - after;
-        }
-        if (gain <= 1e-6) {
-            if (++fails >= 3) break;
-            continue;
-        }
-        fails = 0;
-        cur.set(trial);
-
-        const id = "s" + ctx.gradCount++;
-        const rgb = hex(oklabToRgb01(col[0], col[1], col[2]));
         ctx.defs.push(
-            `<radialGradient id="${id}">` +
-                OFFS.map(
-                    (t) =>
-                        `<stop offset="${t}" stop-color="${rgb}"` +
-                        (fall(t) < 1 ? ` stop-opacity="${fmt(fall(t))}"` : "") +
-                        "/>"
-                ).join("") +
+            `<linearGradient id="${id}" gradientUnits="userSpaceOnUse" x1="${fmt(p1[0])}" y1="${fmt(p1[1])}" x2="${fmt(p2[0])}" y2="${fmt(p2[1])}">` +
+                stopTags((t) => t) +
+                "</linearGradient>"
+        );
+    } else {
+        if (tmax <= 0) return flat;
+        ctx.defs.push(
+            `<radialGradient id="${id}" gradientUnits="userSpaceOnUse" cx="${fmt(best.cx)}" cy="${fmt(best.cy)}" r="${fmt(tmax)}">` +
+                stopTags((t) => (tmin + t * span) / tmax) +
                 "</radialGradient>"
         );
-        markup += `<circle cx="${fmt(cx)}" cy="${fmt(cy)}" r="${fmt(R)}" fill="url(#${id})"/>`;
     }
-    if (!markup) return "";
-    const cid = "c" + ctx.gradCount++;
-    ctx.defs.push(`<clipPath id="${cid}"><path d="${clipD}" clip-rule="evenodd"/></clipPath>`);
-    return `<g clip-path="url(#${cid})">${markup}</g>`;
-}
-
-function erf(x: number): number {
-    const sgn = x < 0 ? -1 : 1;
-    x = Math.abs(x);
-    const t = 1 / (1 + 0.3275911 * x);
-    const p = ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t;
-    return sgn * (1 - p * Math.exp(-x * x));
-}
-const Phi = (z: number): number => 0.5 * (1 + erf(z / Math.SQRT2));
-
-/** Weights of a Gaussian (sigma in cells) integrated over unit-wide cells. */
-function gaussKernel(sigma: number): { ker: Float64Array; R: number } {
-    const R = Math.max(1, Math.ceil(3 * sigma));
-    const ker = new Float64Array(2 * R + 1);
-    let sum = 0;
-    for (let k = -R; k <= R; k++) {
-        const v = Phi((k + 0.5) / sigma) - Phi((k - 0.5) / sigma);
-        ker[k + R] = v;
-        sum += v;
-    }
-    for (let k = 0; k < ker.length; k++) ker[k] /= sum;
-    return { ker, R };
-}
-
-/** Separable blur of a gw x gh x 3 grid, edge cells replicated (matches the padded render). */
-function blurGrid(src: Float64Array, gw: number, gh: number, ker: Float64Array, R: number): Float64Array {
-    const tmp = new Float64Array(src.length);
-    const out = new Float64Array(src.length);
-    for (let y = 0; y < gh; y++)
-        for (let x = 0; x < gw; x++)
-            for (let c = 0; c < 3; c++) {
-                let s = 0;
-                for (let k = -R; k <= R; k++) {
-                    const xx = Math.min(gw - 1, Math.max(0, x + k));
-                    s += ker[k + R] * src[(y * gw + xx) * 3 + c];
-                }
-                tmp[(y * gw + x) * 3 + c] = s;
-            }
-    for (let y = 0; y < gh; y++)
-        for (let x = 0; x < gw; x++)
-            for (let c = 0; c < 3; c++) {
-                let s = 0;
-                for (let k = -R; k <= R; k++) {
-                    const yy = Math.min(gh - 1, Math.max(0, y + k));
-                    s += ker[k + R] * tmp[(yy * gw + x) * 3 + c];
-                }
-                out[(y * gw + x) * 3 + c] = s;
-            }
-    return out;
-}
-
-/** Value of the blurred grid at (u, v), in cell units (cell j spans [j, j+1]). */
-function fieldAt(
-    c: Float64Array,
-    gw: number,
-    gh: number,
-    u: number,
-    v: number,
-    sigma: number,
-    R: number,
-    out: number[]
-): void {
-    const fu = Math.floor(u),
-        fv = Math.floor(v);
-    const n = 2 * R + 3;
-    const wx = new Float64Array(n),
-        wy = new Float64Array(n);
-    let sx = 0,
-        sy = 0;
-    for (let k = 0; k < n; k++) {
-        const j = fu - R - 1 + k,
-            q = fv - R - 1 + k;
-        wx[k] = Phi((j + 1 - u) / sigma) - Phi((j - u) / sigma);
-        wy[k] = Phi((q + 1 - v) / sigma) - Phi((q - v) / sigma);
-        sx += wx[k];
-        sy += wy[k];
-    }
-    out[0] = out[1] = out[2] = 0;
-    for (let a = 0; a < n; a++) {
-        const jy = Math.min(gh - 1, Math.max(0, fv - R - 1 + a));
-        for (let b = 0; b < n; b++) {
-            const jx = Math.min(gw - 1, Math.max(0, fu - R - 1 + b));
-            const wgt = wy[a] * wx[b];
-            const o3 = (jy * gw + jx) * 3;
-            out[0] += wgt * c[o3];
-            out[1] += wgt * c[o3 + 1];
-            out[2] += wgt * c[o3 + 2];
-        }
-    }
-    const norm = sx * sy;
-    out[0] /= norm;
-    out[1] /= norm;
-    out[2] /= norm;
-}
-
-/** Per-pixel blend weights for one axis of the blurred grid (cell j spans [j, j+1] in cell units). */
-function axisTable(len: number, cell: number, ncell: number, sigma: number, R: number) {
-    const n = 2 * R + 3;
-    const idx = new Int32Array(len * n),
-        wt = new Float64Array(len * n);
-    for (let p = 0; p < len; p++) {
-        const u = (p + 0.5) / cell;
-        const f = Math.floor(u);
-        let s = 0;
-        for (let k = 0; k < n; k++) {
-            const j = f - R - 1 + k;
-            const wv = Phi((j + 1 - u) / sigma) - Phi((j - u) / sigma);
-            wt[p * n + k] = wv;
-            s += wv;
-            idx[p * n + k] = Math.min(ncell - 1, Math.max(0, j));
-        }
-        for (let k = 0; k < n; k++) wt[p * n + k] /= s;
-    }
-    return { idx, wt, n };
-}
-
-/** Render the blurred grid at every pixel of the bbox (sRGB 0..1, bw*bh*3). Separable, so it stays fast. */
-function renderMesh(
-    c: Float64Array,
-    gw: number,
-    gh: number,
-    cw: number,
-    ch: number,
-    bw: number,
-    bh: number,
-    sigma: number,
-    R: number
-): Float32Array {
-    const ax = axisTable(bw, cw, gw, sigma, R),
-        ay = axisTable(bh, ch, gh, sigma, R);
-    const n = ax.n;
-    const T = new Float32Array(gh * bw * 3);
-    for (let jy = 0; jy < gh; jy++)
-        for (let x = 0; x < bw; x++) {
-            let r = 0,
-                g = 0,
-                b = 0;
-            for (let k = 0; k < n; k++) {
-                const wv = ax.wt[x * n + k],
-                    q = (jy * gw + ax.idx[x * n + k]) * 3;
-                r += wv * c[q];
-                g += wv * c[q + 1];
-                b += wv * c[q + 2];
-            }
-            const o3 = (jy * bw + x) * 3;
-            T[o3] = r;
-            T[o3 + 1] = g;
-            T[o3 + 2] = b;
-        }
-    const out = new Float32Array(bw * bh * 3);
-    for (let y = 0; y < bh; y++)
-        for (let x = 0; x < bw; x++) {
-            let r = 0,
-                g = 0,
-                b = 0;
-            for (let k = 0; k < n; k++) {
-                const wv = ay.wt[y * n + k],
-                    q = (ay.idx[y * n + k] * bw + x) * 3;
-                r += wv * T[q];
-                g += wv * T[q + 1];
-                b += wv * T[q + 2];
-            }
-            const o3 = (y * bw + x) * 3;
-            out[o3] = r;
-            out[o3 + 1] = g;
-            out[o3 + 2] = b;
-        }
-    return out;
-}
-
-/**
- * Returns the SVG markup for the region's mesh and, when needErr is set, errAt(i): the OKLab distance
- * between the image and what the blurred mesh paints at pixel i. processRegion feeds that to the
- * patch / split refinement, so hard edges the smooth mesh cannot follow get their own shapes.
- */
-function meshLayers(
-    px: Int32Array,
-    fit: { rmse: number },
-    clipD: string,
-    m: Uint8Array,
-    bx: number,
-    by: number,
-    W: number,
-    ctx: RenderContext,
-    needErr = false
-): { markup: string; errAt: ((i: number) => number) | null } {
-    const { o, w, lab, fmt } = ctx;
-
-    // Interior pixels only: boundary pixels are anti-aliased mixes of neighbouring regions.
-    let src: ArrayLike<number> = px;
-    {
-        const inner: number[] = [];
-        for (let j = 0; j < px.length; j++) {
-            const i = px[j];
-            const k = (((i / w) | 0) - by) * W + ((i % w) - bx);
-            if (m[k - 1] && m[k + 1] && m[k - W] && m[k + W]) inner.push(i);
-        }
-        if (inner.length >= 24) src = inner;
-    }
-    const stride = Math.max(1, Math.ceil(src.length / 200000));
-    const n = Math.ceil(src.length / stride);
-    const us = new Float32Array(n),
-        vs = new Float32Array(n),
-        L = new Float32Array(n * 3);
-    let x0 = Infinity,
-        y0 = Infinity,
-        x1 = -Infinity,
-        y1 = -Infinity;
-    for (let j = 0; j < n; j++) {
-        const i = src[j * stride];
-        us[j] = (i % w) + 0.5;
-        vs[j] = ((i / w) | 0) + 0.5;
-        L[3 * j] = lab[3 * i];
-        L[3 * j + 1] = lab[3 * i + 1];
-        L[3 * j + 2] = lab[3 * i + 2];
-        if (us[j] < x0) x0 = us[j];
-        if (us[j] > x1) x1 = us[j];
-        if (vs[j] < y0) y0 = vs[j];
-        if (vs[j] > y1) y1 = vs[j];
-    }
-    const X0 = Math.floor(x0),
-        Y0 = Math.floor(y0);
-    const bw = Math.max(1, Math.ceil(x1) - X0),
-        bh = Math.max(1, Math.ceil(y1) - Y0);
-    const long = Math.max(bw, bh);
-    const sigma = o.meshBlur;
-    const { ker, R } = gaussKernel(sigma);
-
-    const fitGrid = (cells: number) => {
-        const gw = Math.max(1, Math.round((bw / long) * cells));
-        const gh = Math.max(1, Math.round((bh / long) * cells));
-        const cw = bw / gw,
-            ch = bh / gh;
-
-        // 1. Mean colour per cell.
-        const cnt = new Float64Array(gw * gh);
-        const acc = new Float64Array(gw * gh * 3);
-        for (let j = 0; j < n; j++) {
-            const gx = Math.min(gw - 1, Math.floor((us[j] - X0) / cw));
-            const gy = Math.min(gh - 1, Math.floor((vs[j] - Y0) / ch));
-            const g = gy * gw + gx;
-            cnt[g]++;
-            for (let c = 0; c < 3; c++) acc[3 * g + c] += L[3 * j + c];
-        }
-        const t = new Float64Array(gw * gh * 3); // target colours, sRGB 0..1 (what the blur filter sees)
-        const have = new Uint8Array(gw * gh);
-        let missing = 0;
-        for (let g = 0; g < gw * gh; g++) {
-            if (cnt[g] >= 1) {
-                have[g] = 1;
-                const rgb = oklabToRgb01(acc[3 * g] / cnt[g], acc[3 * g + 1] / cnt[g], acc[3 * g + 2] / cnt[g]);
-                t[3 * g] = rgb[0];
-                t[3 * g + 1] = rgb[1];
-                t[3 * g + 2] = rgb[2];
-            } else missing++;
-        }
-
-        // 2. Cells outside the region (curved outlines, holes): diffuse colour in from neighbours
-        //    so the blur never pulls in black / transparent.
-        while (missing > 0) {
-            const idx: number[] = [],
-                val: number[] = [];
-            for (let gy = 0; gy < gh; gy++)
-                for (let gx = 0; gx < gw; gx++) {
-                    const g = gy * gw + gx;
-                    if (have[g]) continue;
-                    let k = 0,
-                        r = 0,
-                        gg = 0,
-                        b = 0;
-                    for (const [dx, dy] of [
-                        [-1, 0],
-                        [1, 0],
-                        [0, -1],
-                        [0, 1],
-                    ]) {
-                        const xx = gx + dx,
-                            yy = gy + dy;
-                        if (xx < 0 || yy < 0 || xx >= gw || yy >= gh) continue;
-                        const q = yy * gw + xx;
-                        if (!have[q]) continue;
-                        k++;
-                        r += t[3 * q];
-                        gg += t[3 * q + 1];
-                        b += t[3 * q + 2];
-                    }
-                    if (k) {
-                        idx.push(g);
-                        val.push(r / k, gg / k, b / k);
-                    }
-                }
-            if (!idx.length) break;
-            idx.forEach((g, q) => {
-                have[g] = 1;
-                t[3 * g] = val[3 * q];
-                t[3 * g + 1] = val[3 * q + 1];
-                t[3 * g + 2] = val[3 * q + 2];
-            });
-            missing -= idx.length;
-        }
-
-        // 3. Deconvolve: find grid colours whose BLURRED version equals the targets.
-        const c = Float64Array.from(t);
-        for (let it = 0; it < 10; it++) {
-            const b = blurGrid(c, gw, gh, ker, R);
-            for (let i = 0; i < c.length; i++) c[i] = Math.min(1, Math.max(0, c[i] + (t[i] - b[i])));
-        }
-
-        // 4. Pixel-level error of the actual blurred field (not just at cell centres).
-        const sp = Math.max(1, Math.floor(n / 6000));
-        let se = 0,
-            k = 0;
-        const f = [0, 0, 0];
-        for (let j = 0; j < n; j += sp) {
-            fieldAt(c, gw, gh, (us[j] - X0) / cw, (vs[j] - Y0) / ch, sigma, R, f);
-            const tg = oklabToRgb01(L[3 * j], L[3 * j + 1], L[3 * j + 2]);
-            for (let q = 0; q < 3; q++) {
-                const d = f[q] - tg[q];
-                se += d * d;
-                k++;
-            }
-        }
-        return { gw, gh, cw, ch, c, err: Math.sqrt(se / Math.max(1, k)) };
-    };
-
-    // Coarse -> fine until the blurred grid is close enough to the image.
-    const cap = Math.min(o.meshCells, Math.max(2, Math.floor(long / 3)));
-    const levels = [3, 4, 6, 8, 12, 16, 24, 32, 48, 64].filter((v) => v < cap);
-    levels.push(cap);
-    let g = fitGrid(levels[0]);
-    for (let q = 1; q < levels.length && g.err > o.meshTol; q++) g = fitGrid(levels[q]);
-
-    // Emit: rectangles (padded by replicating edge cells) -> blur -> clip to the region.
-    const { gw, gh, cw, ch, c } = g;
-    const P = R + 1;
-    const fid = "m" + ctx.gradCount++,
-        cid = "c" + ctx.gradCount++;
-    const fx = X0 - P * cw,
-        fy = Y0 - P * ch,
-        fW = (gw + 2 * P) * cw,
-        fH = (gh + 2 * P) * ch;
-    ctx.defs.push(
-        `<filter id="${fid}" filterUnits="userSpaceOnUse" x="${fmt(fx)}" y="${fmt(fy)}" width="${fmt(fW)}" height="${fmt(fH)}" color-interpolation-filters="sRGB">` +
-            `<feGaussianBlur stdDeviation="${fmt(sigma * cw)} ${fmt(sigma * ch)}"/></filter>`,
-        `<clipPath id="${cid}"><path d="${clipD}" clip-rule="evenodd"/></clipPath>`
-    );
-    let rects = "";
-    for (let gy = -P; gy < gh + P; gy++) {
-        const sy = Math.min(gh - 1, Math.max(0, gy));
-        let runStart = -P,
-            runCol = "";
-        for (let gx = -P; gx <= gw + P; gx++) {
-            let col = "";
-            if (gx < gw + P) {
-                const sx = Math.min(gw - 1, Math.max(0, gx));
-                const q = (sy * gw + sx) * 3;
-                col = hex([c[q], c[q + 1], c[q + 2]]);
-            }
-            if (col !== runCol) {
-                // merge horizontal runs of identical colour; +0.5px overlap hides AA seams
-                if (runCol)
-                    rects += `<rect x="${fmt(X0 + runStart * cw)}" y="${fmt(Y0 + gy * ch)}" width="${fmt((gx - runStart) * cw + 0.5)}" height="${fmt(ch + 0.5)}" fill="${runCol}"/>`;
-                runStart = gx;
-                runCol = col;
-            }
-        }
-    }
-    const markup = `<g clip-path="url(#${cid})"><g filter="url(#${fid})">${rects}</g></g>`;
-    if (!needErr) return { markup, errAt: null };
-
-    const rend = renderMesh(c, gw, gh, cw, ch, bw, bh, sigma, R);
-    const errAt = (i: number): number => {
-        const x = Math.min(bw - 1, Math.max(0, (i % w) - X0)),
-            y = Math.min(bh - 1, Math.max(0, ((i / w) | 0) - Y0));
-        const q = (y * bw + x) * 3;
-        const l = rgb01ToOklab(rend[q], rend[q + 1], rend[q + 2]);
-        return Math.hypot(lab[3 * i] - l[0], lab[3 * i + 1] - l[1], lab[3 * i + 2] - l[2]);
-    };
-    return { markup, errAt };
-}
-
-/* ------------------------------------------------------------------ split */
-
-function splitRegion(px: Int32Array, ctx: RenderContext): Int32Array[] {
-    const { o, w, lab } = ctx;
-    const n = px.length;
-    let x0 = Infinity,
-        y0 = Infinity,
-        x1 = -1,
-        y1 = -1;
-    for (let j = 0; j < n; j++) {
-        const x = px[j] % w,
-            y = (px[j] / w) | 0;
-        if (x < x0) x0 = x;
-        if (x > x1) x1 = x;
-        if (y < y0) y0 = y;
-        if (y > y1) y1 = y;
-    }
-    const bw = x1 - x0 + 1,
-        bh = y1 - y0 + 1;
-    const posW = 0.06 / Math.max(bw, bh);
-    const F = new Float32Array(n * 5);
-    let lo = 0,
-        hi = 0;
-    for (let j = 0; j < n; j++) {
-        const i = px[j];
-        F[5 * j] = lab[3 * i];
-        F[5 * j + 1] = lab[3 * i + 1];
-        F[5 * j + 2] = lab[3 * i + 2];
-        F[5 * j + 3] = (i % w) * posW;
-        F[5 * j + 4] = ((i / w) | 0) * posW;
-        if (lab[3 * i] < lab[3 * px[lo]]) lo = j;
-        if (lab[3 * i] > lab[3 * px[hi]]) hi = j;
-    }
-    const cen = new Float64Array(10);
-    for (let c = 0; c < 5; c++) {
-        cen[c] = F[5 * lo + c];
-        cen[5 + c] = F[5 * hi + c];
-    }
-    const asg = new Uint8Array(n);
-    for (let it = 0; it < 6; it++) {
-        const sum = new Float64Array(10),
-            cnt = [0, 0];
-        for (let j = 0; j < n; j++) {
-            let d0 = 0,
-                d1 = 0;
-            for (let c = 0; c < 5; c++) {
-                d0 += (F[5 * j + c] - cen[c]) ** 2;
-                d1 += (F[5 * j + c] - cen[5 + c]) ** 2;
-            }
-            const a = d1 < d0 ? 1 : 0;
-            asg[j] = a;
-            cnt[a]++;
-            for (let c = 0; c < 5; c++) sum[5 * a + c] += F[5 * j + c];
-        }
-        if (!cnt[0] || !cnt[1]) return [];
-        for (let a = 0; a < 2; a++) for (let c = 0; c < 5; c++) cen[5 * a + c] = sum[5 * a + c] / cnt[a];
-    }
-
-    const cl = new Uint8Array(bw * bh);
-    for (let j = 0; j < n; j++) cl[(((px[j] / w) | 0) - y0) * bw + ((px[j] % w) - x0)] = 1 + asg[j];
-    const vis = new Uint8Array(bw * bh);
-    const groups: Int32Array[] = [];
-    const stack: number[] = [];
-    for (let j = 0; j < n; j++) {
-        const s = (((px[j] / w) | 0) - y0) * bw + ((px[j] % w) - x0);
-        if (vis[s]) continue;
-        const val = cl[s],
-            comp: number[] = [];
-        stack.push(s);
-        vis[s] = 1;
-        while (stack.length) {
-            const p = stack.pop()!;
-            const x = p % bw,
-                y = (p / bw) | 0;
-            comp.push((y + y0) * w + (x + x0));
-            if (x > 0 && !vis[p - 1] && cl[p - 1] === val) {
-                vis[p - 1] = 1;
-                stack.push(p - 1);
-            }
-            if (x < bw - 1 && !vis[p + 1] && cl[p + 1] === val) {
-                vis[p + 1] = 1;
-                stack.push(p + 1);
-            }
-            if (y > 0 && !vis[p - bw] && cl[p - bw] === val) {
-                vis[p - bw] = 1;
-                stack.push(p - bw);
-            }
-            if (y < bh - 1 && !vis[p + bw] && cl[p + bw] === val) {
-                vis[p + bw] = 1;
-                stack.push(p + bw);
-            }
-        }
-        if (comp.length >= o.minRegionArea) groups.push(Int32Array.from(comp));
-    }
-    groups.sort((a, b) => b.length - a.length);
-    return groups.length >= 2 ? groups : [];
+    return `url(#${id})`;
 }
 
 /* ----------------------------------------------------------------- region */
 
+/** Outline path of one ink component, traced from the soft coverage field. */
 function inkPath(top: number, bx: number, by: number, W: number, H: number, ctx: RenderContext): string {
-    const { o, w, h, soft, inkLabels, fmt } = ctx;
+    const { p, w, h, soft, inkLabels, fmt } = ctx;
     const mm = new Uint8Array(W * H);
     const g = new Float32Array(W * H);
     const foreign = new Uint8Array(W * H);
@@ -1901,18 +1662,11 @@ function inkPath(top: number, bx: number, by: number, W: number, H: number, ctx:
         dm = nx;
     }
     for (let k = 0; k < W * H; k++) if (!dm[k] || foreign[k]) g[k] = 0;
-    return fieldToPath(g, W, H, bx, by, o, fmt);
+    return fieldToPath(g, W, H, bx, by, p, fmt);
 }
 
-function processRegion(
-    px: Int32Array,
-    depth: number,
-    top: number,
-    isInk: boolean,
-    out: PathItem[],
-    ctx: RenderContext
-): void {
-    const { o, w, h, labels, ink, fmt, rank } = ctx;
+function processRegion(px: Int32Array, top: number, isInk: boolean, out: PathItem[], ctx: RenderContext): void {
+    const { p, w, h, labels, ink, fmt, rank } = ctx;
     let x0 = w,
         y0 = h,
         x1 = -1,
@@ -1925,24 +1679,23 @@ function processRegion(
         if (y < y0) y0 = y;
         if (y > y1) y1 = y;
     }
-    const P = o.expand + 4;
+    const P = p.expand + 4;
     const bx = x0 - P,
         by = y0 - P;
     const W = x1 - x0 + 1 + 2 * P,
         H = y1 - y0 + 1 + 2 * P;
     const m0 = new Uint8Array(W * H);
     for (let j = 0; j < px.length; j++) m0[(((px[j] / w) | 0) - by) * W + ((px[j] % w) - bx)] = 1;
-    let m = m0;
 
-    const fit = analyze(px, m0, bx, by, W, ctx);
-
+    const fill = fitFill(px, m0, bx, by, W, isInk, ctx);
     if (isInk) {
         const d = inkPath(top, bx, by, W, H, ctx);
-        if (d) out.push({ d, fill: fit.fill });
+        if (d) out.push({ d, fill });
         return;
     }
 
-    for (let it = 0; it < o.expand; it++) {
+    let m = m0;
+    for (let it = 0; it < p.expand; it++) {
         const nx = m.slice();
         for (let ly = 1; ly < H - 1; ly++) {
             const gy = by + ly;
@@ -1954,94 +1707,14 @@ function processRegion(
                 if (gx < 0 || gx >= w) continue;
                 const g = gy * w + gx;
                 const lg = labels[g];
-                const rankTop = rank ? rank[top] : 0;
-                const rankLg = rank && lg >= 0 ? rank[lg] : 0;
-                if (!(ink[g] || lg === top || (lg >= 0 && rankLg > rankTop))) continue;
+                if (!(ink[g] || lg === top || (lg >= 0 && rank[lg] > rank[top]))) continue;
                 if (m[k - 1] || m[k + 1] || m[k - W] || m[k + W]) nx[k] = 1;
             }
         }
         m = nx;
     }
-
-    // What this region is actually painted with, so refinement measures the error of the real output.
-    let errAt = fit.errAt;
-
-    const d = maskToPath(m, W, H, bx, by, w, h, o, fmt);
-    if (d) {
-        const item: PathItem = { d, fill: fit.fill };
-        if (depth > 0 && o.patchFeather > 0) {
-            item.feather = o.patchFeather;
-            item.box = [bx, by, W, H];
-        }
-        out.push(item);
-        if (px.length >= o.minSplitArea && fit.rmse > o.flatTol) {
-            if (o.meshCells > 0) {
-                const r = meshLayers(px, fit, d, m0, bx, by, W, ctx, depth < o.maxDepth);
-                if (r.markup) item.extra = r.markup;
-                if (r.errAt) errAt = r.errAt;
-            } else if (o.softBlobs > 0) {
-                const extra = softLayers(px, fit, d, m0, bx, by, W, ctx);
-                if (extra) item.extra = extra;
-            }
-        }
-    }
-    // Soft blobs cannot report their error, so they keep replacing the refinement. The mesh does not.
-    if (o.meshCells === 0 && o.softBlobs > 0) return;
-
-    if (depth >= o.maxDepth || px.length < o.minSplitArea) return;
-
-    const E = new Float32Array(W * H);
-    let sq = 0,
-        cnt = 0;
-    for (let j = 0; j < px.length; j++) {
-        const i = px[j];
-        const k = (((i / w) | 0) - by) * W + ((i % w) - bx);
-        if (!(m0[k - 1] && m0[k + 1] && m0[k - W] && m0[k + W])) continue;
-        const e = errAt(i);
-        E[k] = e;
-        sq += e * e;
-        cnt++;
-    }
-    const rmse = cnt ? Math.sqrt(sq / cnt) : 0;
-
-    const seen = new Uint8Array(W * H);
-    const patches: Int32Array[] = [];
-    const stack: number[] = [];
-    for (let j = 0; j < px.length; j++) {
-        const i = px[j];
-        const s0 = (((i / w) | 0) - by) * W + ((i % w) - bx);
-        if (seen[s0] || E[s0] < o.patchCore) continue;
-        const comp: number[] = [];
-        let seeds = 0;
-        stack.push(s0);
-        seen[s0] = 1;
-        while (stack.length) {
-            const p = stack.pop()!;
-            if (E[p] >= o.patchCore) seeds++;
-            comp.push(p);
-            for (const q of [p - 1, p + 1, p - W, p + W])
-                if (!seen[q] && E[q] >= o.patchEdge) {
-                    seen[q] = 1;
-                    stack.push(q);
-                }
-        }
-        if (seeds < o.patchMin) continue;
-        const arr = new Int32Array(comp.length);
-        for (let c = 0; c < comp.length; c++) {
-            const p = comp[c];
-            arr[c] = (((p / W) | 0) + by) * w + ((p % W) + bx);
-        }
-        patches.push(arr);
-    }
-
-    const patched = patches.reduce((a, p) => a + p.length, 0);
-    if (patches.length && patched < px.length * 0.85) {
-        patches.sort((a, b) => b.length - a.length);
-        for (const kid of patches) processRegion(kid, depth + 1, top, false, out, ctx);
-    } else if (rmse > o.splitTol) {
-        const kids = splitRegion(px, ctx);
-        for (const kid of kids) processRegion(kid, depth + 1, top, false, out, ctx);
-    }
+    const d = maskToPath(m, W, H, bx, by, w, h, p, fmt);
+    if (d) out.push({ d, fill });
 }
 
 /* ------------------------------------------------------------------- main */
@@ -2056,6 +1729,7 @@ export function imageDataToSVG(input: ImageDataLike, opts?: SVGOptions): string 
         h = img.height,
         n = w * h,
         data = img.data;
+    const p = derive(o, w, h);
 
     const lab = new Float32Array(n * 3);
     const solid = new Uint8Array(n);
@@ -2066,13 +1740,12 @@ export function imageDataToSVG(input: ImageDataLike, opts?: SVGOptions): string 
         linToOklab(S2L[data[i * 4]], S2L[data[i * 4 + 1]], S2L[data[i * 4 + 2]], lab, i * 3);
         if (lab[i * 3] < o.inkL) ink[i] = 1;
     }
-
     {
         const r = labelComponents(ink, w, h, true);
-        for (let i = 0; i < n; i++) if (r.labels[i] >= 0 && r.sizes[r.labels[i]] < o.minRegionArea) ink[i] = 0;
+        for (let i = 0; i < n; i++) if (r.labels[i] >= 0 && r.sizes[r.labels[i]] < p.minRegionArea) ink[i] = 0;
     }
 
-    const core = new Uint8Array(n);
+    const grad = new Float32Array(n);
     for (let y = 0; y < h; y++)
         for (let x = 0; x < w; x++) {
             const i = y * w + x;
@@ -2087,12 +1760,21 @@ export function imageDataToSVG(input: ImageDataLike, opts?: SVGOptions): string 
                     gy = (lab[yd * 3 + c] - lab[yu * 3 + c]) / 2;
                 g2 += gx * gx + gy * gy;
             }
-            if (g2 <= o.edgeT * o.edgeT) core[i] = 1;
+            grad[i] = Math.sqrt(g2);
         }
+    {
+        const samp: number[] = [];
+        for (let i = 0; i < n; i += 5) if (solid[i] && !ink[i]) samp.push(grad[i]);
+        samp.sort((a, b) => a - b);
+        if (samp.length) p.edgeT = Math.max(p.edgeT, 5 * samp[samp.length >> 1]);
+    }
+
+    const core = new Uint8Array(n);
+    for (let i = 0; i < n; i++) if (solid[i] && !ink[i] && grad[i] <= p.edgeT) core[i] = 1;
     const reg = labelComponents(core, w, h, false);
     for (let i = 0; i < n; i++) {
         const l = reg.labels[i];
-        if (l >= 0 && reg.sizes[l] < o.minRegionArea) reg.labels[i] = -1;
+        if (l >= 0 && reg.sizes[l] < p.minRegionArea) reg.labels[i] = -1;
     }
 
     {
@@ -2106,9 +1788,9 @@ export function imageDataToSVG(input: ImageDataLike, opts?: SVGOptions): string 
         }
         for (let l = 0; l < reg.count; l++) if (cntL[l]) for (let c = 0; c < 3; c++) sumL[l * 3 + c] /= cntL[l];
         const isFree = (r: number): boolean => Boolean(solid[r]) && !ink[r] && reg.labels[r] === -1;
-        const nbrs = (p: number): number[] => {
-            const x = p % w;
-            return [x > 0 ? p - 1 : -1, x < w - 1 ? p + 1 : -1, p >= w ? p - w : -1, p < n - w ? p + w : -1];
+        const nbrs = (q: number): number[] => {
+            const x = q % w;
+            return [x > 0 ? q - 1 : -1, x < w - 1 ? q + 1 : -1, q >= w ? q - w : -1, q < n - w ? q + w : -1];
         };
         let frontier: number[] = [];
         const queued = new Uint8Array(n);
@@ -2122,17 +1804,17 @@ export function imageDataToSVG(input: ImageDataLike, opts?: SVGOptions): string 
         while (frontier.length) {
             const pick = new Int32Array(frontier.length);
             for (let k = 0; k < frontier.length; k++) {
-                const p = frontier[k];
+                const q = frontier[k];
                 let bl = -1,
                     bd = Infinity;
-                for (const r of nbrs(p)) {
+                for (const r of nbrs(q)) {
                     if (r < 0) continue;
                     const l = reg.labels[r];
                     if (l < 0) continue;
                     const d =
-                        (lab[p * 3] - sumL[l * 3]) ** 2 +
-                        (lab[p * 3 + 1] - sumL[l * 3 + 1]) ** 2 +
-                        (lab[p * 3 + 2] - sumL[l * 3 + 2]) ** 2;
+                        (lab[q * 3] - sumL[l * 3]) ** 2 +
+                        (lab[q * 3 + 1] - sumL[l * 3 + 1]) ** 2 +
+                        (lab[q * 3 + 2] - sumL[l * 3 + 2]) ** 2;
                     if (d < bd) {
                         bd = d;
                         bl = l;
@@ -2142,8 +1824,8 @@ export function imageDataToSVG(input: ImageDataLike, opts?: SVGOptions): string 
             }
             const next: number[] = [];
             for (let k = 0; k < frontier.length; k++) reg.labels[frontier[k]] = pick[k];
-            for (const p of frontier)
-                for (const r of nbrs(p))
+            for (const q of frontier)
+                for (const r of nbrs(q))
                     if (r >= 0 && isFree(r) && !queued[r]) {
                         queued[r] = 1;
                         next.push(r);
@@ -2191,18 +1873,16 @@ export function imageDataToSVG(input: ImageDataLike, opts?: SVGOptions): string 
     const rank = new Int32Array(reg.count).fill(1 << 30);
     const regionLists = groupPixels(reg.labels, reg.count)
         .map((px, label) => ({ px, label }))
-        .filter((r) => r.px.length >= o.minRegionArea)
+        .filter((r) => r.px.length >= p.minRegionArea)
         .sort((a, b) => b.px.length - a.px.length);
-
     regionLists.forEach((r, k) => (rank[r.label] = k));
-
     const inkLists = groupPixels(inkC.labels, inkC.count)
         .map((px, label) => ({ px, label }))
         .filter((r) => r.px.length > 0)
         .sort((a, b) => b.px.length - a.px.length);
 
     const ctx: RenderContext = {
-        o,
+        p,
         w,
         h,
         lab,
@@ -2210,32 +1890,22 @@ export function imageDataToSVG(input: ImageDataLike, opts?: SVGOptions): string 
         soft,
         inkLabels: inkC.labels,
         labels: reg.labels,
-        fmt: makeFmt(o.precision),
+        fmt: makeFmt(Math.max(w, h) >= 600 ? 1 : 2),
+        fmtT: makeFmt(3),
         defs: [],
         gradCount: 0,
         rank,
     };
 
     const items: PathItem[] = [];
-    for (const r of regionLists) processRegion(r.px, 0, r.label, false, items, ctx);
-    for (const r of inkLists) processRegion(r.px, 0, r.label, true, items, ctx);
+    for (const r of regionLists) processRegion(r.px, r.label, false, items, ctx);
+    for (const r of inkLists) processRegion(r.px, r.label, true, items, ctx);
 
-    let body = "";
-    for (const it of items) {
-        const inner = `<path d="${it.d}" fill="${it.fill}" fill-rule="evenodd"/>` + (it.extra ?? "");
-        if (it.feather && it.box) {
-            const id = "f" + ctx.gradCount++;
-            const pad = Math.ceil(it.feather * 3);
-            const [bx0, by0, bw0, bh0] = it.box;
-            ctx.defs.push(
-                `<filter id="${id}" filterUnits="userSpaceOnUse" x="${bx0 - pad}" y="${by0 - pad}" width="${bw0 + 2 * pad}" height="${bh0 + 2 * pad}" color-interpolation-filters="sRGB"><feGaussianBlur stdDeviation="${ctx.fmt(it.feather)}"/></filter>`
-            );
-            body += `<g filter="url(#${id})">${inner}</g>`;
-        } else body += inner;
-    }
     let svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}" width="${outW}" height="${outH}">`;
     if (ctx.defs.length) svg += "<defs>" + ctx.defs.join("") + "</defs>";
-    return svg + body + "</svg>";
+    svg += '<g fill-rule="evenodd">';
+    for (const it of items) svg += `<path d="${it.d}" fill="${it.fill}"/>`;
+    return svg + "</g></svg>";
 }
 
 export default imageDataToSVG;

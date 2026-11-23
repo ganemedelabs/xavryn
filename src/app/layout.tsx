@@ -20,10 +20,7 @@ const mono = JetBrains_Mono({
 });
 
 export const metadata: Metadata = {
-    title: {
-        default: "Xavryn — Local Raster to SVG Vectorizer",
-        template: "%s | Xavryn",
-    },
+    title: "Xavryn",
     description:
         "Turn raster images into clean, compact SVGs with smooth Bézier curves and fitted gradients locally in the browser.",
     keywords: [

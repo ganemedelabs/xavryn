@@ -8,7 +8,6 @@ import SvgMarkupViewport from "@/components/svg-markup-viewport";
 import ThemeToggle from "@/components/theme-toggle";
 import { autoTune, loadImageData, pickCrops } from "@/lib/auto-tune";
 import { OPTIONS } from "@/lib/img-to-svg";
-import { Preset, PRESETS, resolvePreset } from "@/lib/presets";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type ConversionOptions = {
@@ -64,7 +63,6 @@ export default function HomePage() {
     } | null>(null);
 
     const [options, setOptions] = useState<ConversionOptions>(getDefaultOptions);
-    const [activePreset, setActivePreset] = useState<string | null>(null);
     const [viewMode, setViewMode] = useState<(typeof VIEW_MODES)[number]["id"]>("split");
     const [copied, setCopied] = useState(false);
     const [isDragging, setIsDragging] = useState(false);
@@ -249,15 +247,6 @@ export default function HomePage() {
     const handleOptionChange = <K extends keyof ConversionOptions>(key: K, value: ConversionOptions[K]) => {
         const next = { ...options, [key]: value };
         setOptions(next);
-        setActivePreset(null);
-    };
-
-    const handleApplyPreset = (preset: Preset) => {
-        const next = resolvePreset(preset, options) as ConversionOptions;
-        setOptions(next);
-        setActivePreset(preset.id);
-        setStatusAnnouncement(`${preset.label} preset applied.`);
-        if (file) processImage(file, next);
     };
 
     const handleAutoTune = async () => {
@@ -424,53 +413,26 @@ export default function HomePage() {
                         </Button>
                     </div>
 
-                    {/* Parameters Header, Reset & Presets */}
-                    <div className="space-y-3">
-                        <div className="flex items-center justify-between">
-                            <h2
-                                id="parameters-heading"
-                                className="text-soft text-xs font-semibold tracking-wider uppercase"
-                            >
-                                Parameters
-                            </h2>
-                            <Button
-                                variant="link"
-                                onClick={() => {
-                                    const defaults = getDefaultOptions();
-                                    setOptions(defaults);
-                                    setActivePreset(null);
-                                    setStatusAnnouncement("Parameters reset to defaults.");
-                                    if (file) processImage(file, defaults);
-                                }}
-                                className="text-xs font-medium"
-                            >
-                                Reset
-                            </Button>
-                        </div>
-
-                        <div
-                            role="group"
-                            aria-label="Parameter presets"
-                            className="-mx-1 flex scrollbar-thin gap-2 overflow-x-auto mask-[linear-gradient(to_right,transparent,black_16px,black_calc(100%-16px),transparent)] px-3 pb-2"
+                    {/* Parameters Header & Reset */}
+                    <div className="flex items-center justify-between">
+                        <h2
+                            id="parameters-heading"
+                            className="text-soft text-xs font-semibold tracking-wider uppercase"
                         >
-                            {PRESETS.map((preset) => {
-                                const isActive = activePreset === preset.id;
-                                return (
-                                    <Button
-                                        key={preset.id}
-                                        size="sm"
-                                        variant={isActive ? "primary" : "secondary"}
-                                        title={preset.description}
-                                        aria-pressed={isActive}
-                                        disabled={isTuning}
-                                        onClick={() => handleApplyPreset(preset)}
-                                        className="shrink-0 text-xs font-medium whitespace-nowrap"
-                                    >
-                                        {preset.label}
-                                    </Button>
-                                );
-                            })}
-                        </div>
+                            Parameters
+                        </h2>
+                        <Button
+                            variant="link"
+                            onClick={() => {
+                                const defaults = getDefaultOptions();
+                                setOptions(defaults);
+                                setStatusAnnouncement("Parameters reset to defaults.");
+                                if (file) processImage(file, defaults);
+                            }}
+                            className="text-xs font-medium"
+                        >
+                            Reset
+                        </Button>
                     </div>
 
                     {/* Scrollable Sliders Container */}
