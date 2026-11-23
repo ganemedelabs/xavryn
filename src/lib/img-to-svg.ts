@@ -399,49 +399,6 @@ function reparam(b: number[][], pts: number[][], u: number[]): number[] {
     });
 }
 
-function maxError(pts: number[][], b: number[][], u: number[]): [number, number] {
-    let md = 0,
-        sp = Math.floor(pts.length / 2);
-    for (let i = 1; i < pts.length - 1; i++) {
-        const d = sqd(bezAt(b, u[i]), pts[i]);
-        if (d > md) {
-            md = d;
-            sp = i;
-        }
-    }
-    return [md, sp];
-}
-
-function fitCubic(pts: number[][], t1: number[], t2: number[], tolSq: number, out: number[][][]): void {
-    const n = pts.length;
-    if (n === 2) {
-        const d = Math.sqrt(sqd(pts[0], pts[1])) / 3;
-        out.push([pts[0], add(pts[0], mul(t1, d)), add(pts[1], mul(t2, d)), pts[1]]);
-        return;
-    }
-    let u = chordParams(pts);
-    let b = generateBezier(pts, u, t1, t2);
-    let [err, sp] = maxError(pts, b, u);
-    if (err < tolSq) {
-        out.push(b);
-        return;
-    }
-    if (err < tolSq * 4) {
-        for (let i = 0; i < 6; i++) {
-            u = reparam(b, pts, u);
-            b = generateBezier(pts, u, t1, t2);
-            [err, sp] = maxError(pts, b, u);
-            if (err < tolSq) {
-                out.push(b);
-                return;
-            }
-        }
-    }
-    const center = unit(sub(pts[sp - 1], pts[sp + 1]));
-    fitCubic(pts.slice(0, sp + 1), t1, center, tolSq, out);
-    fitCubic(pts.slice(sp), mul(center, -1), t2, tolSq, out);
-}
-
 /* ------------------------------------------------ segment fitting (lines + cubics) */
 
 /** One piece of an outline: a straight line (`line`) or a cubic Bézier. `p` always holds 4 points. */
